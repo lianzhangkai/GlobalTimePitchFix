@@ -1,6 +1,6 @@
 Package: com.chatgpt.globaltimepitchfix
 Name: GlobalTimePitchFix Injection Probe
-Version: 0.2.5
+Version: 0.2.6
 Architecture: iphoneos-arm
 Description: Injection-only diagnostic build for iOS 13. Shows unmistakable alerts when loaded into Safari and Bilibili, and reports Safari WebContent injection via Darwin notification. Does not modify audio playback.
 Maintainer: Local build
