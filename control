@@ -1,9 +1,9 @@
-Package: com.chatgpt.aplayeraudioprobe
-Name: APlayer Audio Path Probe
-Version: 0.8.2
+Package: com.chatgpt.globaltimepitchfix
+Name: GlobalTimePitchFix - Bili VLC ScaleTempo Prototype
+Version: 0.7.0
 Architecture: iphoneos-arm
-Description: Safe diagnostic probe for APlayer playback-rate audio path on iOS 13.7. iOS13 SDK compatibility + linker fix. Logs AVFoundation, AudioQueue, AudioUnit and likely third-party time-stretch usage to APlayer Documents.
+Description: Experimental Bilibili iOS 13 playback-speed audio using a standalone adaptation of VLC 3.0.x scaletempo (30ms stride, 20% overlap, 14ms search). 1x is exact PCM bypass; Apple AudioQueue rate DSP stays at 1x.
 Maintainer: ChatGPT + user test build
 Author: ChatGPT + user test build
 Section: Tweaks
-Depends: firmware (>= 13.0), (mobilesubstrate | org.coolstar.libhooker)
+Depends: firmware (>= 13.0), mobilesubstrate | org.coolstar.libhooker

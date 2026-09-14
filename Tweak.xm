@@ -1,272 +1,263 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <AVFoundation/AVFoundation.h>
-#import <AudioToolbox/AudioToolbox.h>
-#import <AudioUnit/AudioUnit.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h>
-#import <dlfcn.h>
 #import <substrate.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <new>
+#include "vendor/vlc_scaletempo/GTScaleTempo.h"
 
-static dispatch_queue_t gLogQueue;
-static NSString *gLogPath;
+// Minimal copy of ijkplayer's SDL_AudioSpec layout.
+typedef uint8_t  GTUint8;
+typedef uint16_t GTUint16;
+typedef uint32_t GTUint32;
+typedef uint16_t GTSDL_AudioFormat;
+typedef void (*GTSDL_AudioCallback)(void *userdata, GTUint8 *stream, int len);
 
-static NSString *FourCC(UInt32 x) {
-    char s[5];
-    s[0] = (char)((x >> 24) & 0xff);
-    s[1] = (char)((x >> 16) & 0xff);
-    s[2] = (char)((x >> 8) & 0xff);
-    s[3] = (char)(x & 0xff);
-    s[4] = 0;
-    for (int i = 0; i < 4; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c < 32 || c > 126) s[i] = '.';
-    }
-    return [NSString stringWithUTF8String:s];
+typedef struct GTSDL_AudioSpec {
+    int freq;
+    GTSDL_AudioFormat format;
+    GTUint8 channels;
+    GTUint8 silence;
+    GTUint16 samples;
+    GTUint16 padding;
+    GTUint32 size;
+    GTSDL_AudioCallback callback;
+    void *userdata;
+} GTSDL_AudioSpec;
+
+#define GT_AUDIO_S16SYS 0x8010
+
+typedef struct GTPFContext {
+    GTSDL_AudioCallback originalCallback;
+    void *originalUserdata;
+    int sampleRate;
+    int channels;
+    int frameBytes;
+    volatile float requestedSpeed;
+    volatile int resetRequested;
+    volatile int stopped;
+    GTScaleTempo *scaleTempo;
+    int16_t *inputS16;
+    float *inputF32;
+    float *outputF32;
+    int capacityFrames;
+} GTPFContext;
+
+static const void *kGTPFContextKey = &kGTPFContextKey;
+
+static GTPFContext *GTPFGetContext(id obj) {
+    NSValue *value = objc_getAssociatedObject(obj, kGTPFContextKey);
+    return value ? (GTPFContext *)[value pointerValue] : NULL;
 }
 
-static void ProbeLog(NSString *fmt, ...) {
-    if (!gLogQueue || !gLogPath) return;
-    va_list args;
-    va_start(args, fmt);
-    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    NSTimeInterval t = [NSDate date].timeIntervalSince1970;
-    NSString *line = [NSString stringWithFormat:@"%.3f %@\n", t, body ?: @""];
-    dispatch_async(gLogQueue, ^{
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-        if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:gLogPath contents:nil attributes:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
+static BOOL GTPFEnsureCapacity(GTPFContext *ctx, int frames) {
+    if (!ctx || frames <= 0) return NO;
+    if (ctx->capacityFrames >= frames && ctx->inputS16 && ctx->inputF32 && ctx->outputF32) return YES;
+    size_t count = (size_t)frames * (size_t)ctx->channels;
+
+    int16_t *s16 = (int16_t *)realloc(ctx->inputS16, count * sizeof(int16_t));
+    if (!s16) return NO;
+    ctx->inputS16 = s16;
+
+    float *in = (float *)realloc(ctx->inputF32, count * sizeof(float));
+    if (!in) return NO;
+    ctx->inputF32 = in;
+
+    float *out = (float *)realloc(ctx->outputF32, count * sizeof(float));
+    if (!out) return NO;
+    ctx->outputF32 = out;
+
+    ctx->capacityFrames = frames;
+    return YES;
+}
+
+static BOOL GTPFResetScaleTempo(GTPFContext *ctx, float speed) {
+    if (!ctx) return NO;
+    if (ctx->scaleTempo) {
+        delete ctx->scaleTempo;
+        ctx->scaleTempo = NULL;
+    }
+
+    GTScaleTempo *st = new (std::nothrow) GTScaleTempo(ctx->sampleRate, ctx->channels);
+    if (!st || !st->valid()) {
+        delete st;
+        return NO;
+    }
+    st->setSpeed(speed);
+    ctx->scaleTempo = st;
+    ctx->resetRequested = 0;
+    return YES;
+}
+
+static inline int16_t GTPFFloatToS16(float x) {
+    if (x > 1.0f) x = 1.0f;
+    if (x < -1.0f) x = -1.0f;
+    int v = (int)lrintf(x * 32767.0f);
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return (int16_t)v;
+}
+
+static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
+    GTPFContext *ctx = (GTPFContext *)userdata;
+    if (!ctx || !stream || len <= 0 || !ctx->originalCallback || ctx->stopped) {
+        if (stream && len > 0) memset(stream, 0, (size_t)len);
+        return;
+    }
+
+    float speed = ctx->requestedSpeed;
+    if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) speed = 1.0f;
+
+    // Exact 1x bypass: no conversion, no DSP, original PCM goes straight to AudioQueue.
+    if (fabsf(speed - 1.0f) < 0.0001f) {
+        ctx->originalCallback(ctx->originalUserdata, stream, len);
+        ctx->resetRequested = 1;
+        return;
+    }
+
+    if (ctx->frameBytes <= 0 || (len % ctx->frameBytes) != 0) {
+        ctx->originalCallback(ctx->originalUserdata, stream, len);
+        return;
+    }
+
+    const int outputFrames = len / ctx->frameBytes;
+    if (outputFrames <= 0 || !GTPFEnsureCapacity(ctx, outputFrames)) {
+        ctx->originalCallback(ctx->originalUserdata, stream, len);
+        return;
+    }
+
+    if (ctx->resetRequested || !ctx->scaleTempo) {
+        if (!GTPFResetScaleTempo(ctx, speed)) {
+            ctx->originalCallback(ctx->originalUserdata, stream, len);
+            return;
         }
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:data];
-            [fh closeFile];
-        } @catch (__unused NSException *e) {}
-    });
-}
-
-static NSString *AlgName(NSString *alg) {
-    if (!alg) return @"(nil)";
-    return alg;
-}
-
-%hook AVPlayer
-- (void)setRate:(float)rate {
-    ProbeLog(@"AVPlayer setRate %.3f", rate);
-    %orig;
-}
-- (void)setRate:(float)rate time:(CMTime)itemTime atHostTime:(CMTime)hostClockTime {
-    ProbeLog(@"AVPlayer setRate:time:atHostTime %.3f", rate);
-    %orig;
-}
-%end
-
-%hook AVPlayerItem
-- (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    ProbeLog(@"AVPlayerItem setAudioTimePitchAlgorithm %@", AlgName(algorithm));
-    %orig;
-}
-%end
-
-%hook AVSampleBufferAudioRenderer
-- (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    ProbeLog(@"AVSampleBufferAudioRenderer setAudioTimePitchAlgorithm %@", AlgName(algorithm));
-    %orig;
-}
-%end
-
-%hook AVAudioUnitTimePitch
-- (void)setRate:(float)rate {
-    ProbeLog(@"AVAudioUnitTimePitch setRate %.3f", rate);
-    %orig;
-}
-- (void)setPitch:(float)pitch {
-    ProbeLog(@"AVAudioUnitTimePitch setPitch %.3f", pitch);
-    %orig;
-}
-- (void)setOverlap:(float)overlap {
-    ProbeLog(@"AVAudioUnitTimePitch setOverlap %.3f", overlap);
-    %orig;
-}
-%end
-
-%hook AVAudioUnitVarispeed
-- (void)setRate:(float)rate {
-    ProbeLog(@"AVAudioUnitVarispeed setRate %.3f", rate);
-    %orig;
-}
-%end
-
-static OSStatus (*orig_AudioQueueSetProperty)(AudioQueueRef, AudioQueuePropertyID, const void *, UInt32);
-static OSStatus repl_AudioQueueSetProperty(AudioQueueRef aq, AudioQueuePropertyID pid, const void *data, UInt32 size) {
-    if (pid == kAudioQueueProperty_EnableTimePitch ||
-        pid == kAudioQueueProperty_TimePitchAlgorithm ||
-        pid == kAudioQueueProperty_TimePitchBypass) {
-        UInt32 v = 0;
-        if (data && size >= sizeof(UInt32)) memcpy(&v, data, sizeof(UInt32));
-        if (pid == kAudioQueueProperty_TimePitchAlgorithm) {
-            ProbeLog(@"AudioQueueSetProperty TimePitchAlgorithm 0x%08x '%@'", (unsigned)v, FourCC(v));
-        } else if (pid == kAudioQueueProperty_EnableTimePitch) {
-            ProbeLog(@"AudioQueueSetProperty EnableTimePitch %u", (unsigned)v);
-        } else {
-            ProbeLog(@"AudioQueueSetProperty TimePitchBypass %u", (unsigned)v);
-        }
-    }
-    return orig_AudioQueueSetProperty(aq, pid, data, size);
-}
-
-static OSStatus (*orig_AudioQueueSetParameter)(AudioQueueRef, AudioQueueParameterID, AudioQueueParameterValue);
-static OSStatus repl_AudioQueueSetParameter(AudioQueueRef aq, AudioQueueParameterID pid, AudioQueueParameterValue value) {
-    if (pid == kAudioQueueParam_PlayRate || pid == kAudioQueueParam_Pitch) {
-        ProbeLog(@"AudioQueueSetParameter id=%u value=%.3f", (unsigned)pid, (double)value);
-    }
-    return orig_AudioQueueSetParameter(aq, pid, value);
-}
-
-static BOOL IsInterestingAudioUnit(AudioUnit unit, AudioComponentDescription *outDesc) {
-    if (!unit) return NO;
-    AudioComponent comp = AudioComponentInstanceGetComponent(unit);
-    if (!comp) return NO;
-    AudioComponentDescription d;
-    memset(&d, 0, sizeof(d));
-    if (AudioComponentGetDescription(comp, &d) != noErr) return NO;
-    if (outDesc) *outDesc = d;
-    // iOS 13.7 SDK exposes NewTimePitch ('nutp') and Varispeed.
-    // The legacy kAudioUnitSubType_TimePitch identifier is not declared in this SDK,
-    // so do not reference it directly or clang 10 will fail the build.
-    return (d.componentSubType == kAudioUnitSubType_NewTimePitch ||
-            d.componentSubType == kAudioUnitSubType_Varispeed);
-}
-
-static OSStatus (*orig_AudioUnitSetParameter)(AudioUnit, AudioUnitParameterID, AudioUnitScope, AudioUnitElement, AudioUnitParameterValue, UInt32);
-static OSStatus repl_AudioUnitSetParameter(AudioUnit unit, AudioUnitParameterID pid, AudioUnitScope scope, AudioUnitElement element, AudioUnitParameterValue value, UInt32 offset) {
-    AudioComponentDescription d;
-    if (IsInterestingAudioUnit(unit, &d)) {
-        ProbeLog(@"AudioUnitSetParameter subtype='%@' pid=%u scope=%u elem=%u value=%.3f", FourCC(d.componentSubType), (unsigned)pid, (unsigned)scope, (unsigned)element, (double)value);
-    }
-    return orig_AudioUnitSetParameter(unit, pid, scope, element, value, offset);
-}
-
-// Optional direct hooks if APlayer contains/exported Sonic symbols.
-typedef void (*SonicSetSpeedFn)(void *, float);
-static SonicSetSpeedFn orig_sonicSetSpeed = NULL;
-static void repl_sonicSetSpeed(void *stream, float speed) {
-    ProbeLog(@"sonicSetSpeed %.3f", speed);
-    orig_sonicSetSpeed(stream, speed);
-}
-
-typedef void (*STDoubleSetterFn)(void *, double);
-static STDoubleSetterFn orig_stSetTempo = NULL;
-static STDoubleSetterFn orig_stSetRate = NULL;
-static STDoubleSetterFn orig_stSetPitch = NULL;
-static void repl_stSetTempo(void *self, double v) { ProbeLog(@"SoundTouch::setTempo %.3f", v); orig_stSetTempo(self, v); }
-static void repl_stSetRate(void *self, double v)  { ProbeLog(@"SoundTouch::setRate %.3f", v);  orig_stSetRate(self, v); }
-static void repl_stSetPitch(void *self, double v) { ProbeLog(@"SoundTouch::setPitch %.3f", v); orig_stSetPitch(self, v); }
-
-static void InstallOptionalSymbolHooks(void) {
-    void *p = dlsym(RTLD_DEFAULT, "sonicSetSpeed");
-    ProbeLog(@"symbol sonicSetSpeed %@", p ? @"FOUND" : @"not found");
-    if (p) MSHookFunction(p, (void *)&repl_sonicSetSpeed, (void **)&orig_sonicSetSpeed);
-
-    p = dlsym(RTLD_DEFAULT, "_ZN10soundtouch10SoundTouch8setTempoEd");
-    ProbeLog(@"symbol SoundTouch::setTempo %@", p ? @"FOUND" : @"not found");
-    if (p) MSHookFunction(p, (void *)&repl_stSetTempo, (void **)&orig_stSetTempo);
-
-    p = dlsym(RTLD_DEFAULT, "_ZN10soundtouch10SoundTouch7setRateEd");
-    ProbeLog(@"symbol SoundTouch::setRate %@", p ? @"FOUND" : @"not found");
-    if (p) MSHookFunction(p, (void *)&repl_stSetRate, (void **)&orig_stSetRate);
-
-    p = dlsym(RTLD_DEFAULT, "_ZN10soundtouch10SoundTouch8setPitchEd");
-    ProbeLog(@"symbol SoundTouch::setPitch %@", p ? @"FOUND" : @"not found");
-    if (p) MSHookFunction(p, (void *)&repl_stSetPitch, (void **)&orig_stSetPitch);
-}
-
-static BOOL ContainsKeyword(NSString *s) {
-    if (!s) return NO;
-    NSString *x = s.lowercaseString;
-    NSArray *keys = @[@"alook", @"aplayer", @"player", @"audio", @"soundtouch", @"tdstretch", @"sonic", @"pitch", @"ffmpeg", @"libav", @"ijk", @"vlc", @"ksy", @"media"];
-    for (NSString *k in keys) if ([x containsString:k]) return YES;
-    return NO;
-}
-
-static void DumpInterestingImagesAndClasses(void) {
-    ProbeLog(@"---- loaded non-system images ----");
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *cname = _dyld_get_image_name(i);
-        if (!cname) continue;
-        NSString *path = [NSString stringWithUTF8String:cname];
-        if ([path hasPrefix:@"/System/"] || [path hasPrefix:@"/usr/lib/"]) continue;
-        ProbeLog(@"IMAGE %@", path.lastPathComponent);
+    } else {
+        ctx->scaleTempo->setSpeed(speed);
     }
 
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *classes = (Class *)calloc((size_t)n, sizeof(Class));
-    if (!classes) return;
-    n = objc_getClassList(classes, n);
-    ProbeLog(@"---- interesting app/framework classes ----");
-    for (int i = 0; i < n; i++) {
-        Class c = classes[i];
-        const char *cn = class_getName(c);
-        const char *img = class_getImageName(c);
-        if (!cn || !img) continue;
-        NSString *name = [NSString stringWithUTF8String:cn];
-        NSString *image = [NSString stringWithUTF8String:img];
-        if ([image hasPrefix:@"/System/"] || [image hasPrefix:@"/usr/lib/"]) continue;
-        if (ContainsKeyword(name) || ContainsKeyword(image.lastPathComponent)) {
-            ProbeLog(@"CLASS %@ [%@]", name, image.lastPathComponent);
-        }
+    // Pull source PCM repeatedly until VLC-style scaletempo has enough output
+    // for one hardware AudioQueue callback. At 3x this normally consumes ~3x
+    // source PCM while the hardware queue itself remains fixed at 1x.
+    int loops = 0;
+    const int maxLoops = 24;
+    while (ctx->scaleTempo->availableFrames() < outputFrames && loops < maxLoops) {
+        ctx->originalCallback(ctx->originalUserdata, (GTUint8 *)ctx->inputS16, len);
+        const int values = outputFrames * ctx->channels;
+        for (int i = 0; i < values; ++i) ctx->inputF32[i] = (float)ctx->inputS16[i] / 32768.0f;
+        if (!ctx->scaleTempo->push(ctx->inputF32, outputFrames)) break;
+        loops++;
     }
-    free(classes);
+
+    int got = ctx->scaleTempo->read(ctx->outputF32, outputFrames);
+    int16_t *dst = (int16_t *)stream;
+    const int gotValues = got * ctx->channels;
+    for (int i = 0; i < gotValues; ++i) dst[i] = GTPFFloatToS16(ctx->outputF32[i]);
+
+    // Startup or unexpected starvation: zero-fill only the missing tail.
+    if (got < outputFrames) {
+        size_t offset = (size_t)got * (size_t)ctx->frameBytes;
+        size_t missing = (size_t)(outputFrames - got) * (size_t)ctx->frameBytes;
+        memset(stream + offset, 0, missing);
+    }
 }
 
-static void ScanExecutableKeywords(void) {
-    NSString *exe = [NSBundle mainBundle].executablePath;
-    NSData *data = [NSData dataWithContentsOfFile:exe options:NSDataReadingMappedIfSafe error:nil];
-    if (!data) return;
-    const char *bytes = (const char *)data.bytes;
-    NSUInteger len = data.length;
-    NSArray *keys = @[@"SoundTouch", @"TDStretch", @"sonicSetSpeed", @"RubberBand", @"libavcodec", @"FFmpeg", @"AVAudioUnitTimePitch", @"NewTimePitch"];
-    ProbeLog(@"---- executable keyword scan ----");
-    for (NSString *key in keys) {
-        NSData *needleData = [key dataUsingEncoding:NSUTF8StringEncoding];
-        const char *needle = (const char *)needleData.bytes;
-        NSUInteger nlen = needleData.length;
-        BOOL found = NO;
-        if (nlen > 0 && len >= nlen) {
-            for (NSUInteger i = 0; i <= len - nlen; i++) {
-                if (memcmp(bytes + i, needle, nlen) == 0) { found = YES; break; }
-            }
-        }
-        ProbeLog(@"KEYWORD %@ %@", key, found ? @"FOUND" : @"not found");
+typedef id (*InitAudioSpecIMP)(id, SEL, const GTSDL_AudioSpec *);
+typedef void (*RateSetterIMP)(id, SEL, float);
+typedef void (*VoidMethodIMP)(id, SEL);
+
+static InitAudioSpecIMP orig_initWithAudioSpec = NULL;
+static RateSetterIMP orig_setPlaybackRate = NULL;
+static VoidMethodIMP orig_flush = NULL;
+static VoidMethodIMP orig_stop = NULL;
+
+static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec) {
+    if (!spec || !spec->callback || spec->freq <= 0 || spec->channels < 1 || spec->channels > 2 || spec->format != GT_AUDIO_S16SYS) {
+        return orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, spec) : nil;
     }
+
+    GTPFContext *ctx = (GTPFContext *)calloc(1, sizeof(GTPFContext));
+    if (!ctx) return orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, spec) : nil;
+
+    ctx->originalCallback = spec->callback;
+    ctx->originalUserdata = spec->userdata;
+    ctx->sampleRate = spec->freq;
+    ctx->channels = spec->channels;
+    ctx->frameBytes = spec->channels * 2;
+    ctx->requestedSpeed = 1.0f;
+    ctx->resetRequested = 1;
+    ctx->stopped = 0;
+    ctx->scaleTempo = NULL;
+
+    GTSDL_AudioSpec modified = *spec;
+    modified.callback = GTPFPCMCallback;
+    modified.userdata = ctx;
+
+    id result = orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, &modified) : nil;
+    if (!result) {
+        free(ctx);
+        return nil;
+    }
+
+    objc_setAssociatedObject(result, kGTPFContextKey, [NSValue valueWithPointer:ctx], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return result;
+}
+
+static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
+    GTPFContext *ctx = GTPFGetContext(self);
+    if (ctx) {
+        float sane = rate;
+        if (!isfinite(sane) || sane < 0.25f || sane > 6.0f) sane = 1.0f;
+        float old = ctx->requestedSpeed;
+        ctx->requestedSpeed = sane;
+        if (fabsf(old - sane) > 0.0001f) ctx->resetRequested = 1;
+    }
+
+    // Keep Apple's AudioQueue playback-rate DSP completely out of the path.
+    // IJKFFMoviePlayerController still receives the real user speed and drives
+    // video/clock synchronization; only the audio queue is held at 1x.
+    if (orig_setPlaybackRate) orig_setPlaybackRate(self, _cmd, 1.0f);
+}
+
+static void hook_flush(id self, SEL _cmd) {
+    GTPFContext *ctx = GTPFGetContext(self);
+    if (ctx) ctx->resetRequested = 1;
+    if (orig_flush) orig_flush(self, _cmd);
+}
+
+static void hook_stop(id self, SEL _cmd) {
+    GTPFContext *ctx = GTPFGetContext(self);
+    if (ctx) {
+        // Prototype safety choice: do not free here. AudioQueue callbacks may still
+        // be unwinding. The small context is reclaimed when Bilibili exits.
+        ctx->stopped = 1;
+    }
+    if (orig_stop) orig_stop(self, _cmd);
+}
+
+static BOOL GTHookMethod(Class cls, SEL sel, IMP replacement, IMP *originalOut) {
+    if (!cls || !class_getInstanceMethod(cls, sel)) return NO;
+    MSHookMessageEx(cls, sel, replacement, originalOut);
+    return YES;
+}
+
+static void GTPFInstall(void) {
+    Class cls = NSClassFromString(@"IJKSDLAudioQueueController");
+    if (!cls) return;
+    GTHookMethod(cls, @selector(initWithAudioSpec:), (IMP)hook_initWithAudioSpec, (IMP *)&orig_initWithAudioSpec);
+    GTHookMethod(cls, @selector(setPlaybackRate:), (IMP)hook_setPlaybackRate, (IMP *)&orig_setPlaybackRate);
+    GTHookMethod(cls, @selector(flush), (IMP)hook_flush, (IMP *)&orig_flush);
+    GTHookMethod(cls, @selector(stop), (IMP)hook_stop, (IMP *)&orig_stop);
 }
 
 %ctor {
     @autoreleasepool {
         NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
-        if (![bid isEqualToString:@"com.alookbrowser.player"]) return;
-
-        gLogQueue = dispatch_queue_create("com.chatgpt.aplayeraudioprobe.log", DISPATCH_QUEUE_SERIAL);
-        NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
-        gLogPath = [docs stringByAppendingPathComponent:@"APlayerAudioProbe.log"];
-        [[NSFileManager defaultManager] removeItemAtPath:gLogPath error:nil];
-        ProbeLog(@"APlayerAudioProbe 0.8.0 START bundle=%@ executable=%@ home=%@", bid, [NSBundle mainBundle].executablePath.lastPathComponent, NSHomeDirectory());
-
-        MSHookFunction((void *)AudioQueueSetProperty, (void *)&repl_AudioQueueSetProperty, (void **)&orig_AudioQueueSetProperty);
-        MSHookFunction((void *)AudioQueueSetParameter, (void *)&repl_AudioQueueSetParameter, (void **)&orig_AudioQueueSetParameter);
-        MSHookFunction((void *)AudioUnitSetParameter, (void *)&repl_AudioUnitSetParameter, (void **)&orig_AudioUnitSetParameter);
-
-        InstallOptionalSymbolHooks();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            DumpInterestingImagesAndClasses();
-            ScanExecutableKeywords();
-            ProbeLog(@"---- READY: now test 1x -> 2x -> 3x -> 1x ----");
+        if (![bid isEqualToString:@"tv.danmaku.bilianime"]) return;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            GTPFInstall();
         });
     }
 }
