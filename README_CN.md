@@ -1,4 +1,4 @@
-# GlobalTimePitchFix 0.6.1 - Bilibili SoundTouch Speech Prototype
+# GlobalTimePitchFix 0.6.2 - Bilibili SoundTouch Speech Prototype
 
 目的：在 iPadOS 13.7 的旧版 Bilibili iOS 客户端中，彻底绕过 Apple AudioQueue TimePitch，改用 Bilibili 自己曾为 Android ijkplayer 集成的 SoundTouch 1.9.2（WSOLA-like）进行倍速音频处理。
 
@@ -30,3 +30,10 @@ SoundTouch 来自 https://github.com/bilibili/soundtouch ，LGPL-2.1-or-later。
 - 修复旧 clang 10 + `-Werror` 下 Bilibili SoundTouch `TDStretch.cpp` 的 `_scanOffsets` 未使用常量警告。
 - 仅对 `-Wunused-const-variable` 降级，不关闭其它 `-Werror`，避免掩盖真正的编译错误。
 - DSP / SoundTouch 参数与 0.6.0 完全相同。
+
+
+## 0.6.2 链接修复
+- 修复 `detectCPUextensions()` 未定义导致的 arm64/arm64e 链接失败。
+- 将 Bilibili SoundTouch 的 `source/SoundTouch/cpu_detect_x86.cpp` 一并编译。
+- 在 ARM/ARM64 上该文件的 `detectCPUextensions()` 会安全返回 0，不会启用 x86 MMX/SSE 优化。
+- SoundTouch 算法与 0.6.1 完全不变。

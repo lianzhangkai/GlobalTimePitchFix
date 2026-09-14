@@ -9,6 +9,7 @@ ST_SRC = \
 	vendor/soundtouch/source/SoundTouch/AAFilter.cpp \
 	vendor/soundtouch/source/SoundTouch/FIRFilter.cpp \
 	vendor/soundtouch/source/SoundTouch/FIFOSampleBuffer.cpp \
+	vendor/soundtouch/source/SoundTouch/cpu_detect_x86.cpp \
 	vendor/soundtouch/source/SoundTouch/RateTransposer.cpp \
 	vendor/soundtouch/source/SoundTouch/SoundTouch.cpp \
 	vendor/soundtouch/source/SoundTouch/TDStretch.cpp \
