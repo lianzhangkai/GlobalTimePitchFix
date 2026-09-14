@@ -1,9 +1,9 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix - Bili Sonic Prototype (Safer)
-Version: 0.5.1
+Name: GlobalTimePitchFix - Bili SoundTouch Speech
+Version: 0.6.0
 Architecture: iphoneos-arm
-Description: Experimental Bilibili ijkplayer PCM time-stretch using Sonic. iOS 13 old-arm64e build.
-Maintainer: ChatGPT-assisted local build
-Author: ChatGPT-assisted local build
+Description: Experimental Bilibili iOS 13 high-quality playback-speed audio using Bilibili's Android-era SoundTouch WSOLA path. Speech-tuned; bypasses Apple TimePitch.
+Maintainer: ChatGPT + user test build
+Author: ChatGPT + user test build
 Section: Tweaks
 Depends: firmware (>= 13.0), (mobilesubstrate | org.coolstar.libhooker)

@@ -1,27 +1,26 @@
-# GlobalTimePitchFix 0.5.1 — B站 Sonic 原型（安全性修订）
+# GlobalTimePitchFix 0.6.0 - Bilibili SoundTouch Speech Prototype
 
-这是实验版，只注入 `tv.danmaku.bilianime`。
+目的：在 iPadOS 13.7 的旧版 Bilibili iOS 客户端中，彻底绕过 Apple AudioQueue TimePitch，改用 Bilibili 自己曾为 Android ijkplayer 集成的 SoundTouch 1.9.2（WSOLA-like）进行倍速音频处理。
 
-目标：彻底绕开 Apple AudioQueue 的 TimePitch。B站仍然把真实倍速（1.5/2/3x）交给 ijkplayer 上层；但 IJKSDLAudioQueueController 的硬件播放速率被固定为 1.0x。PCM 在送入 AudioQueue 前由 Sonic 处理。
+## 设计
+- 1.0x：PCM 原样直通，不经过 SoundTouch。
+- >1.0x：SoundTouch 只修改 tempo，pitch=1.0、rate=1.0。
+- Apple AudioQueue 始终被固定在 1.0x，因此 Apple Spectral/TimeDomain 不参与倍速。
+- QuickSeek 关闭。
+- 使用 float 内部处理。
+- 针对高速人声使用比音乐默认值更短的 sequence / seek window：
+  - <1.9x: 35 / 15 / 8 ms
+  - 1.9–2.49x: 25 / 12 / 6 ms
+  - >=2.5x: 18 / 8 / 5 ms
 
-- 1.0x：完全 bypass，原始 PCM 直接输出。
-- >1.0x：Sonic `speed = 用户倍速`，`pitch = 1.0`，`rate = 1.0`。
-- 切倍速/拖动进度条：清空 Sonic 内部状态，避免旧缓冲拖尾。
-- 长按 3x：同一条路径处理。
-
-Sonic 是专门为高速语音设计的算法，官方文档明确强调 2x 以上的语音速度，并支持最高远高于 3x。Sonic 使用 Apache-2.0 许可证；GitHub Actions 在构建时从官方 `waywardgeek/sonic` 仓库获取 `sonic.c` / `sonic.h`。
+这些参数是实验性的，后续根据 2x/3x A/B 结果继续调。
 
 ## 测试顺序
+1. 1x 是否完全正常
+2. 2x 与 Xiaomi 14 Ultra 同视频 A/B
+3. 长按 3x 10–20 秒
+4. 3x 松手回 1x 是否立即恢复
+5. 是否有断音、延迟、音画不同步、闪退
 
-1. 先播放 1x 30 秒：必须声音正常、不卡顿。
-2. 切 1.5x：听人声并观察音画同步。
-3. 切 2x：和小米 14 Ultra 同一视频对比。
-4. 长按 3x 10~20 秒，再松手回 1x：重点看是否爆音、断音、严重不同步。
-5. 拖动进度条再测试 2x/3x。
-
-如果出现闪退、无声或严重不同步，请先卸载本 tweak 或降回之前版本；这是 PCM 链路原型，不建议长时间留用，确认表现后再迭代。
-
-
-## 0.5.1 相比 0.5.0
-
-修正停止播放时的生命周期风险：0.5.0 在 `-stop` 返回附近立即释放 Sonic/PCM context，但 AudioQueue 回调可能仍在收尾，存在 use-after-free 闪退可能。0.5.1 测试版在停止时只标记 `stopped`，不立即释放 callback userdata；会产生少量进程内存泄漏，但适合短时间验证 Sonic 音质，关闭 B站后内存自然释放。确认音频链稳定后再做正式的安全回收。
+## 许可证
+SoundTouch 来自 https://github.com/bilibili/soundtouch ，LGPL-2.1-or-later。GitHub Actions 构建时从该仓库获取源码，本项目仅用于个人设备实验。
