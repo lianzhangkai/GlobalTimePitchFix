@@ -1,8 +1,8 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix Bili IJK Probe
-Version: 0.3.3
+Name: GlobalTimePitchFix Bili AudioQueue Spectral Fix
+Version: 0.4.0
 Architecture: iphoneos-arm
-Description: Bilibili-only safe IJK playback-rate path probe for iPadOS 13.7 Odyssey/libhooker.
+Description: Fixes old Bilibili/ijkplayer AudioQueue time-pitch setup on iPadOS 13.7 by forcing Spectral after the AudioQueueRef is valid.
 Maintainer: ChatGPT
 Author: ChatGPT
 Section: Tweaks

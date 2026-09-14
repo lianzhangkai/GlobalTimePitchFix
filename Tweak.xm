@@ -1,116 +1,98 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 
-// Bilibili-only probe. No AVFoundation hooks.
-// Goal: detect whether this old Bilibili build uses ijkplayer's playbackRate path.
+// Bilibili-only fix for old ijkplayer builds.
+// The public IJKSDLAudioQueueController.m sets TimePitchAlgorithm on
+// _audioQueueRef before assigning audioQueueRef to that ivar. This tweak
+// re-applies the intended algorithm after the queue is actually valid.
 
-static NSMutableSet<NSString *> *GTShown;
+#define GTPF_ALGORITHM kAudioQueueTimePitchAlgorithm_Spectral
 
-static UIViewController *GTTopViewController(UIViewController *controller) {
-    if (!controller) return nil;
-    if (controller.presentedViewController) return GTTopViewController(controller.presentedViewController);
-    if ([controller isKindOfClass:[UINavigationController class]]) {
-        UIViewController *v = [(UINavigationController *)controller visibleViewController];
-        return GTTopViewController(v ?: controller);
+typedef id   (*InitWithAudioSpecIMP)(id, SEL, const void *);
+typedef void (*SetPlaybackRateIMP)(id, SEL, float);
+
+static InitWithAudioSpecIMP orig_initWithAudioSpec = NULL;
+static SetPlaybackRateIMP   orig_setPlaybackRate = NULL;
+
+static AudioQueueRef GTPFGetQueue(id obj) {
+    if (!obj) return NULL;
+    Class cls = object_getClass(obj);
+    Ivar ivar = class_getInstanceVariable(cls, "_audioQueueRef");
+    if (!ivar) return NULL;
+
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    uint8_t *base = (uint8_t *)(__bridge void *)obj;
+    return *(AudioQueueRef *)(base + offset);
+}
+
+static void GTPFConfigureQueue(id obj) {
+    AudioQueueRef q = GTPFGetQueue(obj);
+    if (!q) return;
+
+    UInt32 enabled = 1;
+    AudioQueueSetProperty(q,
+                          kAudioQueueProperty_EnableTimePitch,
+                          &enabled,
+                          sizeof(enabled));
+
+    UInt32 algorithm = GTPF_ALGORITHM;
+    AudioQueueSetProperty(q,
+                          kAudioQueueProperty_TimePitchAlgorithm,
+                          &algorithm,
+                          sizeof(algorithm));
+}
+
+static id hook_initWithAudioSpec(id self, SEL _cmd, const void *spec) {
+    id result = orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, spec) : self;
+    if (result) {
+        // At this point ijkplayer has finished assigning _audioQueueRef.
+        GTPFConfigureQueue(result);
     }
-    if ([controller isKindOfClass:[UITabBarController class]]) {
-        UIViewController *v = [(UITabBarController *)controller selectedViewController];
-        return GTTopViewController(v ?: controller);
+    return result;
+}
+
+static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
+    // Re-apply immediately before ijkplayer toggles bypass / play rate.
+    // This also handles cases where AudioQueue internally resets the property.
+    GTPFConfigureQueue(self);
+    if (orig_setPlaybackRate) orig_setPlaybackRate(self, _cmd, rate);
+}
+
+static void GTPFInstallHooks(void) {
+    Class cls = NSClassFromString(@"IJKSDLAudioQueueController");
+    if (!cls) return;
+
+    SEL initSel = NSSelectorFromString(@"initWithAudioSpec:");
+    Method initMethod = class_getInstanceMethod(cls, initSel);
+    if (initMethod) {
+        MSHookMessageEx(cls,
+                        initSel,
+                        (IMP)hook_initWithAudioSpec,
+                        (IMP *)&orig_initWithAudioSpec);
     }
-    return controller;
-}
 
-static UIWindow *GTKeyWindow(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    for (UIWindow *w in app.windows) if (w.isKeyWindow) return w;
-    return app.windows.firstObject;
-}
-
-static void GTPresentOnce(NSString *key, NSString *message) {
-    if (!key || !message) return;
-    @synchronized (GTShown) {
-        if ([GTShown containsObject:key]) return;
-        [GTShown addObject:key];
+    SEL rateSel = @selector(setPlaybackRate:);
+    Method rateMethod = class_getInstanceMethod(cls, rateSel);
+    if (rateMethod) {
+        MSHookMessageEx(cls,
+                        rateSel,
+                        (IMP)hook_setPlaybackRate,
+                        (IMP *)&orig_setPlaybackRate);
     }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = GTKeyWindow();
-        UIViewController *presenter = GTTopViewController(window.rootViewController);
-        if (!presenter || !presenter.view.window) return;
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"GTPF Bili IJK Probe"
-                                                                       message:message
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [presenter presentViewController:alert animated:YES completion:nil];
-    });
-}
-
-typedef void (*RateSetterIMP)(id, SEL, float);
-static RateSetterIMP orig_IJKFF_setPlaybackRate = NULL;
-static RateSetterIMP orig_IJKAV_setPlaybackRate = NULL;
-static RateSetterIMP orig_IJKAudioQ_setPlaybackRate = NULL;
-static RateSetterIMP orig_IJKMP_setPlaybackRate = NULL;
-
-static void hook_IJKFF_setPlaybackRate(id self, SEL _cmd, float rate) {
-    NSString *key = [NSString stringWithFormat:@"IJKFF_%.3f", rate];
-    NSString *msg = [NSString stringWithFormat:@"命中 IJKFFMoviePlayerController setPlaybackRate:\nrate = %.3f", rate];
-    GTPresentOnce(key, msg);
-    if (orig_IJKFF_setPlaybackRate) orig_IJKFF_setPlaybackRate(self, _cmd, rate);
-}
-
-static void hook_IJKAV_setPlaybackRate(id self, SEL _cmd, float rate) {
-    NSString *key = [NSString stringWithFormat:@"IJKAV_%.3f", rate];
-    NSString *msg = [NSString stringWithFormat:@"命中 IJKAVMoviePlayerController setPlaybackRate:\nrate = %.3f", rate];
-    GTPresentOnce(key, msg);
-    if (orig_IJKAV_setPlaybackRate) orig_IJKAV_setPlaybackRate(self, _cmd, rate);
-}
-
-static void hook_IJKAudioQ_setPlaybackRate(id self, SEL _cmd, float rate) {
-    NSString *key = [NSString stringWithFormat:@"IJKAudioQ_%.3f", rate];
-    NSString *msg = [NSString stringWithFormat:@"命中 IJKSDLAudioQueueController setPlaybackRate:\nrate = %.3f", rate];
-    GTPresentOnce(key, msg);
-    if (orig_IJKAudioQ_setPlaybackRate) orig_IJKAudioQ_setPlaybackRate(self, _cmd, rate);
-}
-
-static void hook_IJKMP_setPlaybackRate(id self, SEL _cmd, float rate) {
-    NSString *key = [NSString stringWithFormat:@"IJKMP_%.3f", rate];
-    NSString *msg = [NSString stringWithFormat:@"命中 IJKMPMoviePlayerController setPlaybackRate:\nrate = %.3f", rate];
-    GTPresentOnce(key, msg);
-    if (orig_IJKMP_setPlaybackRate) orig_IJKMP_setPlaybackRate(self, _cmd, rate);
-}
-
-static BOOL GTHookRateSetter(NSString *className, RateSetterIMP replacement, RateSetterIMP *originalOut) {
-    Class cls = NSClassFromString(className);
-    if (!cls) return NO;
-    SEL sel = @selector(setPlaybackRate:);
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) return NO;
-    MSHookMessageEx(cls, sel, (IMP)replacement, (IMP *)originalOut);
-    return YES;
-}
-
-static void GTInstallIJKHooks(void) {
-    BOOL ff = GTHookRateSetter(@"IJKFFMoviePlayerController", hook_IJKFF_setPlaybackRate, &orig_IJKFF_setPlaybackRate);
-    BOOL av = GTHookRateSetter(@"IJKAVMoviePlayerController", hook_IJKAV_setPlaybackRate, &orig_IJKAV_setPlaybackRate);
-    BOOL aq = GTHookRateSetter(@"IJKSDLAudioQueueController", hook_IJKAudioQ_setPlaybackRate, &orig_IJKAudioQ_setPlaybackRate);
-    BOOL mp = GTHookRateSetter(@"IJKMPMoviePlayerController", hook_IJKMP_setPlaybackRate, &orig_IJKMP_setPlaybackRate);
-
-    NSString *summary = [NSString stringWithFormat:
-        @"0.3.3 已加载。\n\n检测到可 hook：\nIJKFFMoviePlayerController: %@\nIJKAVMoviePlayerController: %@\nIJKSDLAudioQueueController: %@\nIJKMPMoviePlayerController: %@\n\n请打开视频后切换 1× → 2×。",
-        ff ? @"是" : @"否", av ? @"是" : @"否", aq ? @"是" : @"否", mp ? @"是" : @"否"];
-    GTPresentOnce(@"startup_summary", summary);
 }
 
 %ctor {
     @autoreleasepool {
-        GTShown = [NSMutableSet set];
         NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
         if (![bid isEqualToString:@"tv.danmaku.bilianime"]) return;
 
-        // Delay so bundled frameworks/classes have finished loading and UIKit is ready.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            GTInstallIJKHooks();
+        // The IJK classes live in a bundled framework in this Bilibili build,
+        // so wait briefly for them to be loaded before installing hooks.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            GTPFInstallHooks();
         });
     }
 }

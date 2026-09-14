@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = GlobalTimePitchFix
 GlobalTimePitchFix_FILES = Tweak.xm
 GlobalTimePitchFix_CFLAGS = -fobjc-arc
-GlobalTimePitchFix_FRAMEWORKS = Foundation UIKit
+GlobalTimePitchFix_FRAMEWORKS = Foundation AudioToolbox
 
 include $(THEOS_MAKE_PATH)/tweak.mk
