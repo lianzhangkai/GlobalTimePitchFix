@@ -1,3 +1,9 @@
+# GlobalTimePitchFix 0.3.1 — Audio Path Probe
+
+这是 0.3.0 的编译修正版。0.3.0 使用 Logos `%hookf` 探测 C 音频函数，在当前 old-ABI 构建链的 Logos 预处理阶段会报 `missing closing parenthesis`。0.3.1 改为 `MSHookFunction`，探测目标不变。
+
+本版本只做诊断，不修改音质、速度或音高。
+
 # GlobalTimePitchFix 0.3.0 — Audio Path Probe
 
 这是诊断版，不改善音质，也不会强制改播放速度/音高。

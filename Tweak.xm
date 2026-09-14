@@ -5,6 +5,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <math.h>
+#import <substrate.h>
 
 // 0.3.0 AUDIO PATH PROBE ONLY.
 // This build deliberately DOES NOT change playback rate, pitch, or audio quality.
@@ -221,25 +222,32 @@ static void GTRegisterSafariEventObservers(void) {
 
 %end
 
-%hookf(OSStatus, AudioQueueSetParameter,
-       AudioQueueRef inAQ,
-       AudioQueueParameterID inParamID,
-       AudioQueueParameterValue inValue) {
+// C-function probes.  We deliberately use MSHookFunction here instead of Logos %hookf.
+// This keeps the source compatible with the Logos parser used by our old-ABI build chain.
+static OSStatus (*GTOrigAudioQueueSetParameter)(AudioQueueRef, AudioQueueParameterID, AudioQueueParameterValue) = NULL;
+static OSStatus GTAudioQueueSetParameter(AudioQueueRef inAQ,
+                                         AudioQueueParameterID inParamID,
+                                         AudioQueueParameterValue inValue) {
     if (inParamID == kAudioQueueParam_PlayRate && (inValue > 1.01f || (inValue > 0.0f && inValue < 0.99f))) {
         GTReport(@"AudioQueue_PlayRate", [NSString stringWithFormat:@"rate=%.3f", (double)inValue]);
     } else if (inParamID == kAudioQueueParam_Pitch && fabs((double)inValue) > 0.01) {
         GTReport(@"AudioQueue_Pitch", [NSString stringWithFormat:@"cents=%.1f", (double)inValue]);
     }
-    return %orig;
+    return GTOrigAudioQueueSetParameter ? GTOrigAudioQueueSetParameter(inAQ, inParamID, inValue) : -1;
 }
 
-%hookf(OSStatus, AudioUnitSetParameter,
-       AudioUnit inUnit,
-       AudioUnitParameterID inID,
-       AudioUnitScope inScope,
-       AudioUnitElement inElement,
-       AudioUnitParameterValue inValue,
-       UInt32 inBufferOffsetInFrames) {
+static OSStatus (*GTOrigAudioUnitSetParameter)(AudioUnit,
+                                                AudioUnitParameterID,
+                                                AudioUnitScope,
+                                                AudioUnitElement,
+                                                AudioUnitParameterValue,
+                                                UInt32) = NULL;
+static OSStatus GTAudioUnitSetParameter(AudioUnit inUnit,
+                                        AudioUnitParameterID inID,
+                                        AudioUnitScope inScope,
+                                        AudioUnitElement inElement,
+                                        AudioUnitParameterValue inValue,
+                                        UInt32 inBufferOffsetInFrames) {
     AudioComponent component = AudioComponentInstanceGetComponent(inUnit);
     AudioComponentDescription desc = {0};
     if (component && AudioComponentGetDescription(component, &desc) == noErr) {
@@ -250,11 +258,17 @@ static void GTRegisterSafariEventObservers(void) {
             GTReport(@"AudioUnit_Varispeed_Rate", [NSString stringWithFormat:@"rate=%.3f", (double)inValue]);
         }
     }
-    return %orig;
+    return GTOrigAudioUnitSetParameter ? GTOrigAudioUnitSetParameter(inUnit, inID, inScope, inElement, inValue, inBufferOffsetInFrames) : -1;
 }
 
 %ctor {
     @autoreleasepool {
+        MSHookFunction((void *)AudioQueueSetParameter,
+                       (void *)GTAudioQueueSetParameter,
+                       (void **)&GTOrigAudioQueueSetParameter);
+        MSHookFunction((void *)AudioUnitSetParameter,
+                       (void *)GTAudioUnitSetParameter,
+                       (void **)&GTOrigAudioUnitSetParameter);
         GTReportedEvents = [NSMutableSet set];
         if (GTIsSafariMain()) {
             GTRegisterSafariEventObservers();

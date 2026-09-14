@@ -1,6 +1,6 @@
 Package: com.chatgpt.globaltimepitchfix
 Name: GlobalTimePitchFix Audio Path Probe
-Version: 0.3.0
+Version: 0.3.1
 Architecture: iphoneos-arm
 Description: Diagnostic build for iOS 13. Traces which playback-rate/time-pitch APIs are actually used by Safari WebContent and Bilibili. Does not modify audio.
 Maintainer: Local build

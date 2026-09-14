@@ -11,4 +11,4 @@ GlobalTimePitchFix_CFLAGS = -fobjc-arc
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 before-package::
-	@echo "Building GlobalTimePitchFix 0.3.0 Audio Path Probe for iOS 13.x (old arm64e ABI toolchain required)."
+	@echo "Building GlobalTimePitchFix 0.3.1 Audio Path Probe for iOS 13.x (old arm64e ABI toolchain required)."
