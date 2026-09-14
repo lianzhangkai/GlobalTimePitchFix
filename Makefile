@@ -8,7 +8,7 @@ TWEAK_NAME = APlayerAudioProbe
 APlayerAudioProbe_FILES = Tweak.xm
 APlayerAudioProbe_CFLAGS = -fobjc-arc -O2
 APlayerAudioProbe_CCFLAGS = -O2
-APlayerAudioProbe_FRAMEWORKS = Foundation UIKit AVFoundation AudioToolbox AudioUnit
+APlayerAudioProbe_FRAMEWORKS = Foundation UIKit AVFoundation AudioToolbox
 APlayerAudioProbe_LIBRARIES = substrate
 
 include $(THEOS_MAKE_PATH)/tweak.mk

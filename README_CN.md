@@ -1,3 +1,11 @@
+# APlayer Audio Probe 0.8.2
+
+本版修复 iOS 13.7 SDK 链接错误：`ld: framework not found AudioUnit`。
+
+iOS 13.7 这里不应单独链接 `AudioUnit.framework`；探针使用到的 Audio Unit C API 由 `AudioToolbox.framework` 提供/导出，因此 Makefile 保留 `AudioToolbox`，移除 `AudioUnit`。
+
+其余探测逻辑与 0.8.1 相同。
+
 # APlayer Audio Probe 0.8.1
 
 修复 iOS 13.7 SDK 下 `kAudioUnitSubType_TimePitch` 未声明导致的编译失败。探针功能不变；AudioUnit 部分检测 `NewTimePitch` 与 `Varispeed`。
