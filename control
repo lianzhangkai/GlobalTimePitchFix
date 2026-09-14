@@ -1,6 +1,6 @@
 Package: com.chatgpt.globaltimepitchfix
 Name: GlobalTimePitchFix - Bili SoundTouch Speech
-Version: 0.6.0
+Version: 0.6.1
 Architecture: iphoneos-arm
 Description: Experimental Bilibili iOS 13 high-quality playback-speed audio using Bilibili's Android-era SoundTouch WSOLA path. Speech-tuned; bypasses Apple TimePitch.
 Maintainer: ChatGPT + user test build
