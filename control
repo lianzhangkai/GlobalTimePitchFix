@@ -1,8 +1,8 @@
-Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix - Bili SoundTouch Speech
-Version: 0.6.2
+Package: com.chatgpt.aplayeraudioprobe
+Name: APlayer Audio Path Probe
+Version: 0.8.0
 Architecture: iphoneos-arm
-Description: Experimental Bilibili iOS 13 high-quality playback-speed audio using Bilibili's Android-era SoundTouch WSOLA path. Speech-tuned; bypasses Apple TimePitch.
+Description: Safe diagnostic probe for APlayer playback-rate audio path on iOS 13. Logs AVFoundation, AudioQueue, AudioUnit and likely third-party time-stretch usage to APlayer Documents.
 Maintainer: ChatGPT + user test build
 Author: ChatGPT + user test build
 Section: Tweaks
