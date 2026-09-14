@@ -134,9 +134,11 @@ static BOOL IsInterestingAudioUnit(AudioUnit unit, AudioComponentDescription *ou
     memset(&d, 0, sizeof(d));
     if (AudioComponentGetDescription(comp, &d) != noErr) return NO;
     if (outDesc) *outDesc = d;
+    // iOS 13.7 SDK exposes NewTimePitch ('nutp') and Varispeed.
+    // The legacy kAudioUnitSubType_TimePitch identifier is not declared in this SDK,
+    // so do not reference it directly or clang 10 will fail the build.
     return (d.componentSubType == kAudioUnitSubType_NewTimePitch ||
-            d.componentSubType == kAudioUnitSubType_Varispeed ||
-            d.componentSubType == kAudioUnitSubType_TimePitch);
+            d.componentSubType == kAudioUnitSubType_Varispeed);
 }
 
 static OSStatus (*orig_AudioUnitSetParameter)(AudioUnit, AudioUnitParameterID, AudioUnitScope, AudioUnitElement, AudioUnitParameterValue, UInt32);

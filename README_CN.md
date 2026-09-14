@@ -1,3 +1,7 @@
+# APlayer Audio Probe 0.8.1
+
+修复 iOS 13.7 SDK 下 `kAudioUnitSubType_TimePitch` 未声明导致的编译失败。探针功能不变；AudioUnit 部分检测 `NewTimePitch` 与 `Varispeed`。
+
 # APlayer Audio Path Probe 0.8.0
 
 用途：**只诊断，不修改声音**。目标是确认 APlayer 在 iPadOS 13.7 上 1x / 2x / 3x 倍速时使用的播放器内核、音频输出 API 和 time-stretch 算法。
