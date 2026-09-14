@@ -1,7 +1,5 @@
 {
     Filter = {
-        Bundles = (
-            "tv.danmaku.bilianime"
-        );
+        Bundles = ("tv.danmaku.bilianime");
     };
 }

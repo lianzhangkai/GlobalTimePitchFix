@@ -1,9 +1,9 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix Bili AudioQueue Spectral Fix
-Version: 0.4.0
+Name: GlobalTimePitchFix - Bili Sonic Prototype
+Version: 0.5.0
 Architecture: iphoneos-arm
-Description: Fixes old Bilibili/ijkplayer AudioQueue time-pitch setup on iPadOS 13.7 by forcing Spectral after the AudioQueueRef is valid.
-Maintainer: ChatGPT
-Author: ChatGPT
+Description: Experimental Bilibili ijkplayer PCM time-stretch using Sonic. iOS 13 old-arm64e build.
+Maintainer: ChatGPT-assisted local build
+Author: ChatGPT-assisted local build
 Section: Tweaks
-Depends: firmware (>= 13.0), mobilesubstrate | libhooker
+Depends: firmware (>= 13.0), (mobilesubstrate | org.coolstar.libhooker)

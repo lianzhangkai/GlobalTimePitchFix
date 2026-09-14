@@ -1,20 +1,22 @@
-# GlobalTimePitchFix 0.4.0 - B站 AudioQueue Spectral 修复版
+# GlobalTimePitchFix 0.5.0 — B站 Sonic 原型
 
-只注入 `tv.danmaku.bilianime`。
+这是实验版，只注入 `tv.danmaku.bilianime`。
 
-已确认这版旧 B站使用：
-- `IJKFFMoviePlayerController`
-- `IJKSDLAudioQueueController`
-- `setPlaybackRate:`
+目标：彻底绕开 Apple AudioQueue 的 TimePitch。B站仍然把真实倍速（1.5/2/3x）交给 ijkplayer 上层；但 IJKSDLAudioQueueController 的硬件播放速率被固定为 1.0x。PCM 在送入 AudioQueue 前由 Sonic 处理。
 
-公开 ijkplayer 的 iOS AudioQueue 实现里，创建 AudioQueue 后正确对局部变量 `audioQueueRef` 开启了 TimePitch，
-但随后却在 `_audioQueueRef` 尚未赋值时尝试设置 `TimePitchBypass` 和 `TimePitchAlgorithm=Spectral`。
-等到 `_audioQueueRef` 真正赋值后，原实现没有再次设置算法。
+- 1.0x：完全 bypass，原始 PCM 直接输出。
+- >1.0x：Sonic `speed = 用户倍速`，`pitch = 1.0`，`rate = 1.0`。
+- 切倍速/拖动进度条：清空 Sonic 内部状态，避免旧缓冲拖尾。
+- 长按 3x：同一条路径处理。
 
-本 tweak 在 `_audioQueueRef` 已经有效之后重新设置：
-- EnableTimePitch = 1
-- TimePitchAlgorithm = Spectral
+Sonic 是专门为高速语音设计的算法，官方文档明确强调 2x 以上的语音速度，并支持最高远高于 3x。Sonic 使用 Apache-2.0 许可证；GitHub Actions 在构建时从官方 `waywardgeek/sonic` 仓库获取 `sonic.c` / `sonic.h`。
 
-并在每次 `setPlaybackRate:` 前再次确认 Spectral。
+## 测试顺序
 
-这版不注入 Safari，也没有弹窗探针。
+1. 先播放 1x 30 秒：必须声音正常、不卡顿。
+2. 切 1.5x：听人声并观察音画同步。
+3. 切 2x：和小米 14 Ultra 同一视频对比。
+4. 长按 3x 10~20 秒，再松手回 1x：重点看是否爆音、断音、严重不同步。
+5. 拖动进度条再测试 2x/3x。
+
+如果出现闪退、无声或严重不同步，请先卸载本 tweak 或降回之前版本；这是 PCM 链路原型，不建议长时间留用，确认表现后再迭代。
