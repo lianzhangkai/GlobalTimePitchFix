@@ -43,30 +43,24 @@ jobs:
           mkdir -p "$HOME/theos/toolchain/linux/iphone"
           cp -a /tmp/oldabi-toolchain/ios-arm64e-clang-toolchain/. "$HOME/theos/toolchain/linux/iphone/"
 
-      - name: Fetch Sonic source
+      - name: Fetch Bilibili SoundTouch
         run: |
-          rm -rf /tmp/sonic-src vendor/sonic
-          git clone --depth 1 https://github.com/waywardgeek/sonic.git /tmp/sonic-src
-          mkdir -p vendor/sonic
-          cp /tmp/sonic-src/sonic.c vendor/sonic/sonic.c
-          cp /tmp/sonic-src/sonic.h vendor/sonic/sonic.h
-          cp /tmp/sonic-src/LICENSE vendor/sonic/LICENSE
-          echo "Sonic files fetched:"
-          ls -lh vendor/sonic
-          test -s vendor/sonic/sonic.c
-          test -s vendor/sonic/sonic.h
+          rm -rf vendor/soundtouch
+          mkdir -p vendor
+          git clone --depth 1 https://github.com/bilibili/soundtouch.git vendor/soundtouch
+          test -s vendor/soundtouch/include/SoundTouch.h
+          test -s vendor/soundtouch/source/SoundTouch/SoundTouch.cpp
+          echo "Bilibili SoundTouch fetched"
 
       - name: Build deb
         env:
           THEOS: ${{ env.THEOS }}
         run: |
-          pwd
-          ls -lh vendor/sonic
           make clean package FINALPACKAGE=1 messages=yes
           find packages -maxdepth 1 -type f -name '*.deb' -print
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
-          name: GlobalTimePitchFix-0.5.0-BiliSonicPrototype-iOS13
+          name: GlobalTimePitchFix-0.6.0-BiliSoundTouchSpeech-iOS13
           path: packages/*.deb
