@@ -1,25 +1,18 @@
-# GlobalTimePitchFix 0.2.0 Varispeed 验证版
+# GlobalTimePitchFix 0.2.5 — 注入探针版
 
-这是**诊断版，不是日常使用版**。
+这个版本**不修改音质，也不修改倍速算法**。唯一目的：确认 Odyssey/libhooker 是否真的把 tweak 注入到目标进程。
 
-目的只有一个：确认 tweak 是否真正命中 Safari / WebKit / B站的倍速音频处理路径。
+安装 + Respring 后：
 
-## 预期现象
+1. 打开 B 站：约 2 秒后应弹出“哔哩哔哩主进程已成功加载”。
+2. 打开 Safari：约 2 秒后应弹出“Safari 主进程已成功加载”。
+3. Safari 点 OK 后打开或刷新任意网页。如果 WebKit WebContent 也被注入，应再弹一次“Safari WebContent 已成功加载”。
 
-安装并 Respring 后：
+## 如何解释结果
 
-- 1.0x：音高应基本正常。
-- 1.5x：人声明显变尖。
-- 2.0x：人声会出现非常明显的“松鼠音/升调”，大致接近提高一个八度。
+- B站、Safari主进程、WebContent 三个提示都有：注入链路没问题，下一步查真正的倍速音频路径。
+- B站和Safari主进程有，WebContent没有：libhooker 网页注入仍未生效或 Filter 没命中 WebContent。
+- 三个都没有：dylib 没被 libhooker 正常加载，需要查 tweak 架构/ABI/loader。
+- 只有其中一个 App 有：继续查对应 Bundle/进程过滤。
 
-如果 2.0x 仍然保持正常音高，那么当前 AVFoundation hook 并没有控制到最终的 time-stretch 路径。
-
-## 测试范围
-
-- Safari 主进程
-- `com.apple.WebKit.WebContent`
-- 哔哩哔哩 `tv.danmaku.bilianime`
-
-## 注意
-
-测试结束后不要长期保留此版本。确认结果后应换回 0.1.1 或后续 TimeDomain 版本。
+这个版本测试完就应换掉，不适合作为日常插件。

@@ -1,8 +1,8 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix Varispeed Test
-Version: 0.2.0
+Name: GlobalTimePitchFix Injection Probe
+Version: 0.2.5
 Architecture: iphoneos-arm
-Description: Diagnostic build for iOS 13. Forces AVFoundation time-pitch processing to Varispeed in Safari/WebKit and Bilibili. 2x playback should sound obviously high-pitched if the hook is active.
+Description: Injection-only diagnostic build for iOS 13. Shows unmistakable alerts when loaded into Safari and Bilibili, and reports Safari WebContent injection via Darwin notification. Does not modify audio playback.
 Maintainer: Local build
 Author: Local build
 Section: Tweaks

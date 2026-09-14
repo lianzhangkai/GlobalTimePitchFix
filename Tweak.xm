@@ -1,77 +1,65 @@
 #import <Foundation/Foundation.h>
-#import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
+#import <UIKit/UIKit.h>
+#import <CoreFoundation/CoreFoundation.h>
 
-// 0.2.0 DIAGNOSTIC BUILD ONLY.
-// Force Varispeed so successful hooking is unmistakable:
-// at 2x playback, voices should become much higher-pitched ("chipmunk" effect).
-static AVAudioTimePitchAlgorithm const GTTargetAlgorithm = AVAudioTimePitchAlgorithmVarispeed;
+// 0.2.5 INJECTION PROBE ONLY.
+// This build does NOT change playback rate or audio quality.
+// It only proves whether libhooker actually loads this dylib into:
+//   1) Safari main process
+//   2) Safari WebKit WebContent process
+//   3) Bilibili main process
 
-static inline void GTForcePlayerItem(AVPlayerItem *item) {
-    if (!item) return;
-    @try {
-        item.audioTimePitchAlgorithm = GTTargetAlgorithm;
-    } @catch (__unused NSException *e) {
-        // Fail open: never break playback just because the property rejects a change.
-    }
-}
+static NSString * const GTWebContentNotification = @"com.chatgpt.globaltimepitchfix.webcontent-loaded";
+static BOOL GTDidShowWebAlert = NO;
 
-%hook AVPlayerItem
-
-- (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    // Diagnostic build: ignore the requested algorithm and always force Varispeed.
-    %orig(GTTargetAlgorithm);
-}
-
-%end
-
-%hook AVPlayer
-
-- (void)setRate:(float)rate {
-    if (rate != 0.0f && rate != 1.0f) {
-        GTForcePlayerItem(self.currentItem);
-    }
-    %orig(rate);
-}
-
-- (void)playImmediatelyAtRate:(float)rate {
-    if (rate != 0.0f && rate != 1.0f) {
-        GTForcePlayerItem(self.currentItem);
-    }
-    %orig(rate);
-}
-
-- (void)setRate:(float)rate time:(CMTime)itemTime atHostTime:(CMTime)hostClockTime {
-    if (rate != 0.0f && rate != 1.0f) {
-        GTForcePlayerItem(self.currentItem);
-    }
-    %orig(rate, itemTime, hostClockTime);
-}
-
-- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
-    GTForcePlayerItem(item);
-    %orig(item);
-}
-
-%end
-
-// Some WebKit/MediaSource paths use AVSampleBufferAudioRenderer.
-%hook AVSampleBufferAudioRenderer
-
-- (instancetype)init {
-    id obj = %orig;
-    if (obj) {
+static void GTShowAlertLater(NSString *message, NSTimeInterval delay) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         @try {
-            [obj setAudioTimePitchAlgorithm:GTTargetAlgorithm];
+            UIAlertView *alert = [[UIAlertView alloc]
+                initWithTitle:@"GTPF Injection Probe"
+                message:message
+                delegate:nil
+                cancelButtonTitle:@"OK"
+                otherButtonTitles:nil];
+            [alert show];
         } @catch (__unused NSException *e) {
         }
+    });
+}
+
+static void GTDarwinCallback(CFNotificationCenterRef center,
+                             void *observer,
+                             CFStringRef name,
+                             const void *object,
+                             CFDictionaryRef userInfo) {
+    if (GTDidShowWebAlert) return;
+    GTDidShowWebAlert = YES;
+    GTShowAlertLater(@"Safari WebContent 已成功加载 GlobalTimePitchFix。", 0.2);
+}
+
+%ctor {
+    @autoreleasepool {
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+
+        if ([bundleID isEqualToString:@"com.apple.mobilesafari"]) {
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            NULL,
+                                            GTDarwinCallback,
+                                            (__bridge CFStringRef)GTWebContentNotification,
+                                            NULL,
+                                            CFNotificationSuspensionBehaviorDeliverImmediately);
+            GTShowAlertLater(@"Safari 主进程已成功加载 GlobalTimePitchFix。\n\n点 OK 后打开/刷新一个网页；如果 WebContent 也成功注入，会再弹一次提示。", 2.0);
+        }
+        else if ([bundleID isEqualToString:@"com.apple.WebKit.WebContent"]) {
+            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                                 (__bridge CFStringRef)GTWebContentNotification,
+                                                 NULL,
+                                                 NULL,
+                                                 true);
+        }
+        else if ([bundleID isEqualToString:@"tv.danmaku.bilianime"]) {
+            GTShowAlertLater(@"哔哩哔哩主进程已成功加载 GlobalTimePitchFix。", 2.0);
+        }
     }
-    return obj;
 }
-
-- (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    // Diagnostic build: always force Varispeed.
-    %orig(GTTargetAlgorithm);
-}
-
-%end
