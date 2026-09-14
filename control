@@ -1,9 +1,9 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix Audio Path Probe
-Version: 0.3.1
+Name: GlobalTimePitchFix Safe Audio Path Probe
+Version: 0.3.2
 Architecture: iphoneos-arm
-Description: Diagnostic build for iOS 13. Traces which playback-rate/time-pitch APIs are actually used by Safari WebContent and Bilibili. Does not modify audio.
-Maintainer: Local build
-Author: Local build
+Description: Safe diagnostic probe for iPadOS 13.7 playback audio paths. No audio changes. Removes low-level real-time audio hooks that may crash older apps.
+Maintainer: ChatGPT
+Author: ChatGPT
 Section: Tweaks
-Depends: mobilesubstrate | org.coolstar.libhooker, firmware (>= 13.0), firmware (<< 14.0)
+Depends: firmware (>= 13.0), mobilesubstrate | libhooker

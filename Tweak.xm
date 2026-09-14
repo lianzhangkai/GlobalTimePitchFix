@@ -2,15 +2,13 @@
 #import <UIKit/UIKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <AVFoundation/AVFoundation.h>
-#import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
-#import <math.h>
-#import <substrate.h>
 
-// 0.3.0 AUDIO PATH PROBE ONLY.
-// This build deliberately DOES NOT change playback rate, pitch, or audio quality.
-// It reports which public playback/time-pitch APIs are actually hit when the user
-// changes speed in Safari/WebKit or Bilibili.
+// 0.3.2 SAFE AUDIO PATH PROBE ONLY.
+// Removes low-level AudioQueue/AudioUnit C-function hooks because some apps (notably
+// older Bilibili builds) may call them on real-time audio threads and can crash when
+// a probe allocates Objective-C objects there.
+// This build does NOT change playback rate, pitch, or audio quality.
 
 static NSString * const GTEventPrefix = @"com.chatgpt.globaltimepitchfix.event.";
 static NSMutableSet<NSString *> *GTReportedEvents;
@@ -18,11 +16,9 @@ static NSMutableSet<NSString *> *GTReportedEvents;
 static BOOL GTIsSafariMain(void) {
     return [[[NSBundle mainBundle] bundleIdentifier] ?: @"" isEqualToString:@"com.apple.mobilesafari"];
 }
-
 static BOOL GTIsWebContent(void) {
     return [[[NSBundle mainBundle] bundleIdentifier] ?: @"" isEqualToString:@"com.apple.WebKit.WebContent"];
 }
-
 static BOOL GTIsBilibili(void) {
     return [[[NSBundle mainBundle] bundleIdentifier] ?: @"" isEqualToString:@"tv.danmaku.bilianime"];
 }
@@ -54,31 +50,25 @@ static void GTPresentMessage(NSString *message, NSUInteger retriesLeft) {
         if (!presenter || !presenter.view.window) {
             if (retriesLeft > 0) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    GTPresentMessage(message, retriesLeft - 1);
-                });
+                               dispatch_get_main_queue(), ^{ GTPresentMessage(message, retriesLeft - 1); });
             }
             return;
         }
-
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"GTPF Audio Path Probe"
-            message:message
-            preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                               style:UIAlertActionStyleDefault
-                                             handler:nil]];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"GTPF Safe Probe"
+                                                                       message:message
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [presenter presentViewController:alert animated:YES completion:nil];
     });
 }
 
 static NSString *GTAlgorithmLabel(AVAudioTimePitchAlgorithm algorithm) {
-    if (!algorithm) return @"(nil/default)";
+    if (!algorithm) return @"DefaultNil";
     if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmLowQualityZeroLatency]) return @"LowQualityZeroLatency";
     if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmTimeDomain]) return @"TimeDomain";
     if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmSpectral]) return @"Spectral";
     if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmVarispeed]) return @"Varispeed";
-    return [algorithm description];
+    return @"Other";
 }
 
 static NSString *GTSanitizeEvent(NSString *event) {
@@ -102,19 +92,18 @@ static void GTPostToSafariMain(NSString *event) {
     NSString *safe = GTSanitizeEvent(event);
     NSString *name = [GTEventPrefix stringByAppendingString:safe];
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                         (__bridge CFStringRef)name,
-                                         NULL, NULL, true);
+                                         (__bridge CFStringRef)name, NULL, NULL, true);
 }
 
 static void GTReport(NSString *event, NSString *details) {
     if (GTIsWebContent()) {
-        // Darwin notifications cannot carry userInfo, so put only the event key in the name.
-        GTPostToSafariMain(event);
+        // Encode the small amount of useful detail into the event name because
+        // Darwin notifications cannot carry userInfo across processes.
+        NSString *combined = details.length ? [NSString stringWithFormat:@"%@__%@", event, details] : event;
+        GTPostToSafariMain(combined);
         return;
     }
-    if (GTIsSafariMain() || GTIsBilibili()) {
-        GTMarkAndShowLocal(event, details ?: @"");
-    }
+    if (GTIsSafariMain() || GTIsBilibili()) GTMarkAndShowLocal(event, details ?: @"");
 }
 
 static void GTDarwinEventCallback(__unused CFNotificationCenterRef center,
@@ -129,154 +118,64 @@ static void GTDarwinEventCallback(__unused CFNotificationCenterRef center,
 }
 
 static void GTRegisterSafariEventObservers(void) {
-    NSArray<NSString *> *events = @[
+    NSMutableArray<NSString *> *events = [NSMutableArray arrayWithArray:@[
         @"AVPlayer_setRate",
         @"AVPlayer_playImmediatelyAtRate",
-        @"AVPlayer_setRate_time_atHostTime",
-        @"AVPlayerItem_setAudioTimePitchAlgorithm",
-        @"AVSampleBufferAudioRenderer_setAudioTimePitchAlgorithm",
-        @"AVAudioUnitTimePitch_setRate",
-        @"AVAudioUnitVarispeed_setRate",
-        @"AudioQueue_PlayRate",
-        @"AudioQueue_Pitch",
-        @"AudioUnit_NewTimePitch_Rate",
-        @"AudioUnit_Varispeed_Rate"
-    ];
+        @"AVPlayer_setRate_time_atHostTime"
+    ]];
+    NSArray<NSString *> *algorithms = @[@"DefaultNil", @"LowQualityZeroLatency", @"TimeDomain", @"Spectral", @"Varispeed", @"Other"];
+    for (NSString *alg in algorithms) {
+        [events addObject:[NSString stringWithFormat:@"AVPlayerItem_setAudioTimePitchAlgorithm__%@", alg]];
+        [events addObject:[NSString stringWithFormat:@"AVSampleBufferAudioRenderer_setAudioTimePitchAlgorithm__%@", alg]];
+    }
     for (NSString *event in events) {
         NSString *name = [GTEventPrefix stringByAppendingString:event];
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                        NULL,
-                                        GTDarwinEventCallback,
-                                        (__bridge CFStringRef)name,
-                                        NULL,
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        GTDarwinEventCallback, (__bridge CFStringRef)name, NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
     }
 }
 
 %hook AVPlayer
-
 - (void)setRate:(float)rate {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f)) {
-        NSString *alg = @"";
-        @try { alg = GTAlgorithmLabel(self.currentItem.audioTimePitchAlgorithm); } @catch (__unused NSException *e) {}
-        GTReport(@"AVPlayer_setRate", [NSString stringWithFormat:@"rate=%.3f, currentItem algorithm=%@", rate, alg]);
-    }
+    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f))
+        GTReport(@"AVPlayer_setRate", [NSString stringWithFormat:@"rate=%.3f", rate]);
     %orig(rate);
 }
-
 - (void)playImmediatelyAtRate:(float)rate {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f)) {
-        NSString *alg = @"";
-        @try { alg = GTAlgorithmLabel(self.currentItem.audioTimePitchAlgorithm); } @catch (__unused NSException *e) {}
-        GTReport(@"AVPlayer_playImmediatelyAtRate", [NSString stringWithFormat:@"rate=%.3f, currentItem algorithm=%@", rate, alg]);
-    }
+    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f))
+        GTReport(@"AVPlayer_playImmediatelyAtRate", [NSString stringWithFormat:@"rate=%.3f", rate]);
     %orig(rate);
 }
-
 - (void)setRate:(float)rate time:(CMTime)itemTime atHostTime:(CMTime)hostClockTime {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f)) {
+    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f))
         GTReport(@"AVPlayer_setRate_time_atHostTime", [NSString stringWithFormat:@"rate=%.3f", rate]);
-    }
     %orig(rate, itemTime, hostClockTime);
 }
-
 %end
 
 %hook AVPlayerItem
-
 - (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
     GTReport(@"AVPlayerItem_setAudioTimePitchAlgorithm", GTAlgorithmLabel(algorithm));
     %orig(algorithm);
 }
-
 %end
 
 %hook AVSampleBufferAudioRenderer
-
 - (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
     GTReport(@"AVSampleBufferAudioRenderer_setAudioTimePitchAlgorithm", GTAlgorithmLabel(algorithm));
     %orig(algorithm);
 }
-
 %end
-
-%hook AVAudioUnitTimePitch
-
-- (void)setRate:(float)rate {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f)) {
-        GTReport(@"AVAudioUnitTimePitch_setRate", [NSString stringWithFormat:@"rate=%.3f", rate]);
-    }
-    %orig(rate);
-}
-
-%end
-
-%hook AVAudioUnitVarispeed
-
-- (void)setRate:(float)rate {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f)) {
-        GTReport(@"AVAudioUnitVarispeed_setRate", [NSString stringWithFormat:@"rate=%.3f", rate]);
-    }
-    %orig(rate);
-}
-
-%end
-
-// C-function probes.  We deliberately use MSHookFunction here instead of Logos %hookf.
-// This keeps the source compatible with the Logos parser used by our old-ABI build chain.
-static OSStatus (*GTOrigAudioQueueSetParameter)(AudioQueueRef, AudioQueueParameterID, AudioQueueParameterValue) = NULL;
-static OSStatus GTAudioQueueSetParameter(AudioQueueRef inAQ,
-                                         AudioQueueParameterID inParamID,
-                                         AudioQueueParameterValue inValue) {
-    if (inParamID == kAudioQueueParam_PlayRate && (inValue > 1.01f || (inValue > 0.0f && inValue < 0.99f))) {
-        GTReport(@"AudioQueue_PlayRate", [NSString stringWithFormat:@"rate=%.3f", (double)inValue]);
-    } else if (inParamID == kAudioQueueParam_Pitch && fabs((double)inValue) > 0.01) {
-        GTReport(@"AudioQueue_Pitch", [NSString stringWithFormat:@"cents=%.1f", (double)inValue]);
-    }
-    return GTOrigAudioQueueSetParameter ? GTOrigAudioQueueSetParameter(inAQ, inParamID, inValue) : -1;
-}
-
-static OSStatus (*GTOrigAudioUnitSetParameter)(AudioUnit,
-                                                AudioUnitParameterID,
-                                                AudioUnitScope,
-                                                AudioUnitElement,
-                                                AudioUnitParameterValue,
-                                                UInt32) = NULL;
-static OSStatus GTAudioUnitSetParameter(AudioUnit inUnit,
-                                        AudioUnitParameterID inID,
-                                        AudioUnitScope inScope,
-                                        AudioUnitElement inElement,
-                                        AudioUnitParameterValue inValue,
-                                        UInt32 inBufferOffsetInFrames) {
-    AudioComponent component = AudioComponentInstanceGetComponent(inUnit);
-    AudioComponentDescription desc = {0};
-    if (component && AudioComponentGetDescription(component, &desc) == noErr) {
-        BOOL changedRate = (inValue > 1.01f || (inValue > 0.0f && inValue < 0.99f));
-        if (changedRate && desc.componentSubType == kAudioUnitSubType_NewTimePitch && inID == kNewTimePitchParam_Rate) {
-            GTReport(@"AudioUnit_NewTimePitch_Rate", [NSString stringWithFormat:@"rate=%.3f", (double)inValue]);
-        } else if (changedRate && desc.componentSubType == kAudioUnitSubType_Varispeed && inID == kVarispeedParam_PlaybackRate) {
-            GTReport(@"AudioUnit_Varispeed_Rate", [NSString stringWithFormat:@"rate=%.3f", (double)inValue]);
-        }
-    }
-    return GTOrigAudioUnitSetParameter ? GTOrigAudioUnitSetParameter(inUnit, inID, inScope, inElement, inValue, inBufferOffsetInFrames) : -1;
-}
 
 %ctor {
     @autoreleasepool {
-        MSHookFunction((void *)AudioQueueSetParameter,
-                       (void *)GTAudioQueueSetParameter,
-                       (void **)&GTOrigAudioQueueSetParameter);
-        MSHookFunction((void *)AudioUnitSetParameter,
-                       (void *)GTAudioUnitSetParameter,
-                       (void **)&GTOrigAudioUnitSetParameter);
         GTReportedEvents = [NSMutableSet set];
         if (GTIsSafariMain()) {
             GTRegisterSafariEventObservers();
-            GTPresentMessage(@"0.3 Audio Path Probe 已加载。\n\n请打开视频，先播放 1×，再切到 2×。有命中的路径会弹窗。", 8);
-        } else if (GTIsWebContent()) {
-            // No startup popup in WebContent. Events are forwarded to Safari main process.
+            GTPresentMessage(@"0.3.2 Safe Probe 已加载。\n\n请打开视频，先 1×，再切 2×。", 8);
         } else if (GTIsBilibili()) {
-            GTPresentMessage(@"0.3 Audio Path Probe 已加载。\n\n请播放视频，先 1×，再切到 2×。有命中的路径会弹窗。", 8);
+            GTPresentMessage(@"0.3.2 Safe Probe 已加载。\n\n已移除可能导致旧版 B站闪退的低层 AudioUnit/AudioQueue 探针。", 8);
         }
     }
 }
