@@ -1,45 +1,25 @@
-# GlobalTimePitchFix 0.1 测试版
+# GlobalTimePitchFix 0.2.0 Varispeed 验证版
 
-目标设备：A12X iPad Pro / iPadOS 13.7 / Odyssey(libhooker) / rootful。
+这是**诊断版，不是日常使用版**。
 
-第一版只注入：
-- Safari：com.apple.mobilesafari
-- 哔哩哔哩：tv.danmaku.bilianime
+目的只有一个：确认 tweak 是否真正命中 Safari / WebKit / B站的倍速音频处理路径。
 
-作用：当 AVFoundation 使用 iOS 13 默认的 LowQualityZeroLatency 倍速算法时，改为 Spectral。
+## 预期现象
 
-## 非常重要：A12X + iOS 13.7 的编译要求
+安装并 Respring 后：
 
-iOS 12.0–13.7 的 arm64e 使用旧 ABI。现代 Clang/Xcode 12+ 编出来的 arm64e dylib不能直接用于这个系统。
-必须使用能生成旧 arm64e ABI 的工具链（典型方案：Xcode 11.7，或 clang 10 的旧 arm64e iOS toolchain）。
+- 1.0x：音高应基本正常。
+- 1.5x：人声明显变尖。
+- 2.0x：人声会出现非常明显的“松鼠音/升调”，大致接近提高一个八度。
 
-## 编译
+如果 2.0x 仍然保持正常音高，那么当前 AVFoundation hook 并没有控制到最终的 time-stretch 路径。
 
-准备好兼容旧 ABI 的 Theos 工具链与 iPhoneOS13.7.sdk 后：
+## 测试范围
 
-    cd GlobalTimePitchFix
-    make clean package FINALPACKAGE=1
+- Safari 主进程
+- `com.apple.WebKit.WebContent`
+- 哔哩哔哩 `tv.danmaku.bilianime`
 
-生成的 deb 位于 packages/。
+## 注意
 
-## 安装后测试
-
-1. 安装 deb。
-2. 彻底划掉 Safari 和 B站后台。
-3. 重新打开。
-4. 同一段视频对比 1x / 1.5x / 2x。
-5. 如果 2x 人声明显更清楚，说明命中正确链路。
-
-如果纯人声出现“机器人/金属感”，把 Tweak.xm 中：
-
-    AVAudioTimePitchAlgorithmSpectral
-
-改为：
-
-    AVAudioTimePitchAlgorithmTimeDomain
-
-重新编译即可。
-
-## 卸载
-
-在 Sileo 中卸载 GlobalTimePitchFix，然后彻底退出 Safari/B站再打开。没有修改任何系统文件。
+测试结束后不要长期保留此版本。确认结果后应换回 0.1.1 或后续 TimeDomain 版本。

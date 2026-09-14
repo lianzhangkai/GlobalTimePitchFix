@@ -1,9 +1,9 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix
-Version: 0.1.0
+Name: GlobalTimePitchFix Varispeed Test
+Version: 0.2.0
 Architecture: iphoneos-arm
-Description: Forces AVFoundation low-quality playback time-pitch processing to a higher-quality algorithm on iOS 13. Test build for Safari and Bilibili.
+Description: Diagnostic build for iOS 13. Forces AVFoundation time-pitch processing to Varispeed in Safari/WebKit and Bilibili. 2x playback should sound obviously high-pitched if the hook is active.
 Maintainer: Local build
 Author: Local build
 Section: Tweaks
-Depends: mobilesubstrate, firmware (>= 13.0), firmware (<< 14.0)
+Depends: mobilesubstrate | org.coolstar.libhooker, firmware (>= 13.0), firmware (<< 14.0)

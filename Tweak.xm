@@ -2,37 +2,25 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 
-// First test build: use Spectral, Apple's highest-quality time/pitch algorithm.
-// If spoken voice sounds metallic/robotic, change this one line to:
-// AVAudioTimePitchAlgorithmTimeDomain
-static AVAudioTimePitchAlgorithm const GTTargetAlgorithm = AVAudioTimePitchAlgorithmSpectral;
+// 0.2.0 DIAGNOSTIC BUILD ONLY.
+// Force Varispeed so successful hooking is unmistakable:
+// at 2x playback, voices should become much higher-pitched ("chipmunk" effect).
+static AVAudioTimePitchAlgorithm const GTTargetAlgorithm = AVAudioTimePitchAlgorithmVarispeed;
 
-static inline BOOL GTIsLowQuality(AVAudioTimePitchAlgorithm algorithm) {
-    return algorithm == nil || [algorithm isEqualToString:AVAudioTimePitchAlgorithmLowQualityZeroLatency];
-}
-
-static inline void GTUpgradePlayerItem(AVPlayerItem *item) {
+static inline void GTForcePlayerItem(AVPlayerItem *item) {
     if (!item) return;
     @try {
-        AVAudioTimePitchAlgorithm current = item.audioTimePitchAlgorithm;
-        if (GTIsLowQuality(current)) {
-            item.audioTimePitchAlgorithm = GTTargetAlgorithm;
-        }
+        item.audioTimePitchAlgorithm = GTTargetAlgorithm;
     } @catch (__unused NSException *e) {
-        // Fail open: playback should continue normally if AVFoundation rejects a change.
+        // Fail open: never break playback just because the property rejects a change.
     }
 }
 
 %hook AVPlayerItem
 
 - (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    // Preserve an app's explicit TimeDomain/Spectral/Varispeed choice.
-    // Only replace the old iOS low-quality/default path.
-    if (GTIsLowQuality(algorithm)) {
-        %orig(GTTargetAlgorithm);
-    } else {
-        %orig(algorithm);
-    }
+    // Diagnostic build: ignore the requested algorithm and always force Varispeed.
+    %orig(GTTargetAlgorithm);
 }
 
 %end
@@ -41,35 +29,33 @@ static inline void GTUpgradePlayerItem(AVPlayerItem *item) {
 
 - (void)setRate:(float)rate {
     if (rate != 0.0f && rate != 1.0f) {
-        GTUpgradePlayerItem(self.currentItem);
+        GTForcePlayerItem(self.currentItem);
     }
     %orig(rate);
 }
 
 - (void)playImmediatelyAtRate:(float)rate {
     if (rate != 0.0f && rate != 1.0f) {
-        GTUpgradePlayerItem(self.currentItem);
+        GTForcePlayerItem(self.currentItem);
     }
     %orig(rate);
 }
 
 - (void)setRate:(float)rate time:(CMTime)itemTime atHostTime:(CMTime)hostClockTime {
     if (rate != 0.0f && rate != 1.0f) {
-        GTUpgradePlayerItem(self.currentItem);
+        GTForcePlayerItem(self.currentItem);
     }
     %orig(rate, itemTime, hostClockTime);
 }
 
 - (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
-    GTUpgradePlayerItem(item);
+    GTForcePlayerItem(item);
     %orig(item);
 }
 
 %end
 
-// WebKit / MediaSource-style playback may use AVSampleBufferAudioRenderer
-// instead of a normal AVPlayerItem. iOS defaults this class to the same
-// LowQualityZeroLatency algorithm, so upgrade it at creation time as well.
+// Some WebKit/MediaSource paths use AVSampleBufferAudioRenderer.
 %hook AVSampleBufferAudioRenderer
 
 - (instancetype)init {
@@ -84,11 +70,8 @@ static inline void GTUpgradePlayerItem(AVPlayerItem *item) {
 }
 
 - (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    if (GTIsLowQuality(algorithm)) {
-        %orig(GTTargetAlgorithm);
-    } else {
-        %orig(algorithm);
-    }
+    // Diagnostic build: always force Varispeed.
+    %orig(GTTargetAlgorithm);
 }
 
 %end
