@@ -202,16 +202,16 @@ static void hook_flush(id self, SEL _cmd) {
 
 static void hook_stop(id self, SEL _cmd) {
     GTPFContext *ctx = GTPFGetContext(self);
-    if (ctx) ctx->stopped = 1;
-    if (orig_stop) orig_stop(self, _cmd);
     if (ctx) {
-        if (ctx->sonic) sonicDestroyStream(ctx->sonic);
-        ctx->sonic = NULL;
-        free(ctx->inputBuffer);
-        ctx->inputBuffer = NULL;
-        objc_setAssociatedObject(self, kGTPFContextKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        free(ctx);
+        // AudioQueue callbacks may still be unwinding while -stop returns.
+        // Do NOT free the context here: the callback's userdata is this raw pointer,
+        // and freeing it synchronously can create a use-after-free crash.
+        // This prototype deliberately keeps the small context alive until process exit.
+        // Once the PCM path is proven stable, production cleanup can be moved to a
+        // verified-safe lifecycle point (e.g. after queue disposal/dealloc).
+        ctx->stopped = 1;
     }
+    if (orig_stop) orig_stop(self, _cmd);
 }
 
 static BOOL GTHookMethod(Class cls, SEL sel, IMP replacement, IMP *originalOut) {

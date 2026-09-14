@@ -1,4 +1,4 @@
-# GlobalTimePitchFix 0.5.0 — B站 Sonic 原型
+# GlobalTimePitchFix 0.5.1 — B站 Sonic 原型（安全性修订）
 
 这是实验版，只注入 `tv.danmaku.bilianime`。
 
@@ -20,3 +20,8 @@ Sonic 是专门为高速语音设计的算法，官方文档明确强调 2x 以�
 5. 拖动进度条再测试 2x/3x。
 
 如果出现闪退、无声或严重不同步，请先卸载本 tweak 或降回之前版本；这是 PCM 链路原型，不建议长时间留用，确认表现后再迭代。
+
+
+## 0.5.1 相比 0.5.0
+
+修正停止播放时的生命周期风险：0.5.0 在 `-stop` 返回附近立即释放 Sonic/PCM context，但 AudioQueue 回调可能仍在收尾，存在 use-after-free 闪退可能。0.5.1 测试版在停止时只标记 `stopped`，不立即释放 callback userdata；会产生少量进程内存泄漏，但适合短时间验证 Sonic 音质，关闭 B站后内存自然释放。确认音频链稳定后再做正式的安全回收。
