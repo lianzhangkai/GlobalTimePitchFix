@@ -1,27 +1,12 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <CoreFoundation/CoreFoundation.h>
-#import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
+#import <objc/runtime.h>
+#import <substrate.h>
 
-// 0.3.2 SAFE AUDIO PATH PROBE ONLY.
-// Removes low-level AudioQueue/AudioUnit C-function hooks because some apps (notably
-// older Bilibili builds) may call them on real-time audio threads and can crash when
-// a probe allocates Objective-C objects there.
-// This build does NOT change playback rate, pitch, or audio quality.
+// Bilibili-only probe. No AVFoundation hooks.
+// Goal: detect whether this old Bilibili build uses ijkplayer's playbackRate path.
 
-static NSString * const GTEventPrefix = @"com.chatgpt.globaltimepitchfix.event.";
-static NSMutableSet<NSString *> *GTReportedEvents;
-
-static BOOL GTIsSafariMain(void) {
-    return [[[NSBundle mainBundle] bundleIdentifier] ?: @"" isEqualToString:@"com.apple.mobilesafari"];
-}
-static BOOL GTIsWebContent(void) {
-    return [[[NSBundle mainBundle] bundleIdentifier] ?: @"" isEqualToString:@"com.apple.WebKit.WebContent"];
-}
-static BOOL GTIsBilibili(void) {
-    return [[[NSBundle mainBundle] bundleIdentifier] ?: @"" isEqualToString:@"tv.danmaku.bilianime"];
-}
+static NSMutableSet<NSString *> *GTShown;
 
 static UIViewController *GTTopViewController(UIViewController *controller) {
     if (!controller) return nil;
@@ -43,18 +28,17 @@ static UIWindow *GTKeyWindow(void) {
     return app.windows.firstObject;
 }
 
-static void GTPresentMessage(NSString *message, NSUInteger retriesLeft) {
+static void GTPresentOnce(NSString *key, NSString *message) {
+    if (!key || !message) return;
+    @synchronized (GTShown) {
+        if ([GTShown containsObject:key]) return;
+        [GTShown addObject:key];
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = GTKeyWindow();
         UIViewController *presenter = GTTopViewController(window.rootViewController);
-        if (!presenter || !presenter.view.window) {
-            if (retriesLeft > 0) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ GTPresentMessage(message, retriesLeft - 1); });
-            }
-            return;
-        }
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"GTPF Safe Probe"
+        if (!presenter || !presenter.view.window) return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"GTPF Bili IJK Probe"
                                                                        message:message
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -62,120 +46,71 @@ static void GTPresentMessage(NSString *message, NSUInteger retriesLeft) {
     });
 }
 
-static NSString *GTAlgorithmLabel(AVAudioTimePitchAlgorithm algorithm) {
-    if (!algorithm) return @"DefaultNil";
-    if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmLowQualityZeroLatency]) return @"LowQualityZeroLatency";
-    if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmTimeDomain]) return @"TimeDomain";
-    if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmSpectral]) return @"Spectral";
-    if ([algorithm isEqualToString:AVAudioTimePitchAlgorithmVarispeed]) return @"Varispeed";
-    return @"Other";
+typedef void (*RateSetterIMP)(id, SEL, float);
+static RateSetterIMP orig_IJKFF_setPlaybackRate = NULL;
+static RateSetterIMP orig_IJKAV_setPlaybackRate = NULL;
+static RateSetterIMP orig_IJKAudioQ_setPlaybackRate = NULL;
+static RateSetterIMP orig_IJKMP_setPlaybackRate = NULL;
+
+static void hook_IJKFF_setPlaybackRate(id self, SEL _cmd, float rate) {
+    NSString *key = [NSString stringWithFormat:@"IJKFF_%.3f", rate];
+    NSString *msg = [NSString stringWithFormat:@"命中 IJKFFMoviePlayerController setPlaybackRate:\nrate = %.3f", rate];
+    GTPresentOnce(key, msg);
+    if (orig_IJKFF_setPlaybackRate) orig_IJKFF_setPlaybackRate(self, _cmd, rate);
 }
 
-static NSString *GTSanitizeEvent(NSString *event) {
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."];
-    NSArray<NSString *> *parts = [event componentsSeparatedByCharactersInSet:[allowed invertedSet]];
-    return [parts componentsJoinedByString:@"_"];
+static void hook_IJKAV_setPlaybackRate(id self, SEL _cmd, float rate) {
+    NSString *key = [NSString stringWithFormat:@"IJKAV_%.3f", rate];
+    NSString *msg = [NSString stringWithFormat:@"命中 IJKAVMoviePlayerController setPlaybackRate:\nrate = %.3f", rate];
+    GTPresentOnce(key, msg);
+    if (orig_IJKAV_setPlaybackRate) orig_IJKAV_setPlaybackRate(self, _cmd, rate);
 }
 
-static void GTMarkAndShowLocal(NSString *event, NSString *details) {
-    if (!event) return;
-    @synchronized (GTReportedEvents) {
-        if ([GTReportedEvents containsObject:event]) return;
-        [GTReportedEvents addObject:event];
-    }
-    NSString *msg = details.length ? [NSString stringWithFormat:@"命中：%@\n%@", event, details]
-                                   : [NSString stringWithFormat:@"命中：%@", event];
-    GTPresentMessage(msg, 8);
+static void hook_IJKAudioQ_setPlaybackRate(id self, SEL _cmd, float rate) {
+    NSString *key = [NSString stringWithFormat:@"IJKAudioQ_%.3f", rate];
+    NSString *msg = [NSString stringWithFormat:@"命中 IJKSDLAudioQueueController setPlaybackRate:\nrate = %.3f", rate];
+    GTPresentOnce(key, msg);
+    if (orig_IJKAudioQ_setPlaybackRate) orig_IJKAudioQ_setPlaybackRate(self, _cmd, rate);
 }
 
-static void GTPostToSafariMain(NSString *event) {
-    NSString *safe = GTSanitizeEvent(event);
-    NSString *name = [GTEventPrefix stringByAppendingString:safe];
-    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                         (__bridge CFStringRef)name, NULL, NULL, true);
+static void hook_IJKMP_setPlaybackRate(id self, SEL _cmd, float rate) {
+    NSString *key = [NSString stringWithFormat:@"IJKMP_%.3f", rate];
+    NSString *msg = [NSString stringWithFormat:@"命中 IJKMPMoviePlayerController setPlaybackRate:\nrate = %.3f", rate];
+    GTPresentOnce(key, msg);
+    if (orig_IJKMP_setPlaybackRate) orig_IJKMP_setPlaybackRate(self, _cmd, rate);
 }
 
-static void GTReport(NSString *event, NSString *details) {
-    if (GTIsWebContent()) {
-        // Encode the small amount of useful detail into the event name because
-        // Darwin notifications cannot carry userInfo across processes.
-        NSString *combined = details.length ? [NSString stringWithFormat:@"%@__%@", event, details] : event;
-        GTPostToSafariMain(combined);
-        return;
-    }
-    if (GTIsSafariMain() || GTIsBilibili()) GTMarkAndShowLocal(event, details ?: @"");
+static BOOL GTHookRateSetter(NSString *className, RateSetterIMP replacement, RateSetterIMP *originalOut) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return NO;
+    SEL sel = @selector(setPlaybackRate:);
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) return NO;
+    MSHookMessageEx(cls, sel, (IMP)replacement, (IMP *)originalOut);
+    return YES;
 }
 
-static void GTDarwinEventCallback(__unused CFNotificationCenterRef center,
-                                  __unused void *observer,
-                                  CFStringRef name,
-                                  __unused const void *object,
-                                  __unused CFDictionaryRef userInfo) {
-    NSString *full = (__bridge NSString *)name;
-    if (![full hasPrefix:GTEventPrefix]) return;
-    NSString *event = [full substringFromIndex:GTEventPrefix.length];
-    GTMarkAndShowLocal([@"WebContent → " stringByAppendingString:event], @"");
-}
+static void GTInstallIJKHooks(void) {
+    BOOL ff = GTHookRateSetter(@"IJKFFMoviePlayerController", hook_IJKFF_setPlaybackRate, &orig_IJKFF_setPlaybackRate);
+    BOOL av = GTHookRateSetter(@"IJKAVMoviePlayerController", hook_IJKAV_setPlaybackRate, &orig_IJKAV_setPlaybackRate);
+    BOOL aq = GTHookRateSetter(@"IJKSDLAudioQueueController", hook_IJKAudioQ_setPlaybackRate, &orig_IJKAudioQ_setPlaybackRate);
+    BOOL mp = GTHookRateSetter(@"IJKMPMoviePlayerController", hook_IJKMP_setPlaybackRate, &orig_IJKMP_setPlaybackRate);
 
-static void GTRegisterSafariEventObservers(void) {
-    NSMutableArray<NSString *> *events = [NSMutableArray arrayWithArray:@[
-        @"AVPlayer_setRate",
-        @"AVPlayer_playImmediatelyAtRate",
-        @"AVPlayer_setRate_time_atHostTime"
-    ]];
-    NSArray<NSString *> *algorithms = @[@"DefaultNil", @"LowQualityZeroLatency", @"TimeDomain", @"Spectral", @"Varispeed", @"Other"];
-    for (NSString *alg in algorithms) {
-        [events addObject:[NSString stringWithFormat:@"AVPlayerItem_setAudioTimePitchAlgorithm__%@", alg]];
-        [events addObject:[NSString stringWithFormat:@"AVSampleBufferAudioRenderer_setAudioTimePitchAlgorithm__%@", alg]];
-    }
-    for (NSString *event in events) {
-        NSString *name = [GTEventPrefix stringByAppendingString:event];
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                        GTDarwinEventCallback, (__bridge CFStringRef)name, NULL,
-                                        CFNotificationSuspensionBehaviorDeliverImmediately);
-    }
+    NSString *summary = [NSString stringWithFormat:
+        @"0.3.3 已加载。\n\n检测到可 hook：\nIJKFFMoviePlayerController: %@\nIJKAVMoviePlayerController: %@\nIJKSDLAudioQueueController: %@\nIJKMPMoviePlayerController: %@\n\n请打开视频后切换 1× → 2×。",
+        ff ? @"是" : @"否", av ? @"是" : @"否", aq ? @"是" : @"否", mp ? @"是" : @"否"];
+    GTPresentOnce(@"startup_summary", summary);
 }
-
-%hook AVPlayer
-- (void)setRate:(float)rate {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f))
-        GTReport(@"AVPlayer_setRate", [NSString stringWithFormat:@"rate=%.3f", rate]);
-    %orig(rate);
-}
-- (void)playImmediatelyAtRate:(float)rate {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f))
-        GTReport(@"AVPlayer_playImmediatelyAtRate", [NSString stringWithFormat:@"rate=%.3f", rate]);
-    %orig(rate);
-}
-- (void)setRate:(float)rate time:(CMTime)itemTime atHostTime:(CMTime)hostClockTime {
-    if (rate > 1.01f || (rate > 0.0f && rate < 0.99f))
-        GTReport(@"AVPlayer_setRate_time_atHostTime", [NSString stringWithFormat:@"rate=%.3f", rate]);
-    %orig(rate, itemTime, hostClockTime);
-}
-%end
-
-%hook AVPlayerItem
-- (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    GTReport(@"AVPlayerItem_setAudioTimePitchAlgorithm", GTAlgorithmLabel(algorithm));
-    %orig(algorithm);
-}
-%end
-
-%hook AVSampleBufferAudioRenderer
-- (void)setAudioTimePitchAlgorithm:(AVAudioTimePitchAlgorithm)algorithm {
-    GTReport(@"AVSampleBufferAudioRenderer_setAudioTimePitchAlgorithm", GTAlgorithmLabel(algorithm));
-    %orig(algorithm);
-}
-%end
 
 %ctor {
     @autoreleasepool {
-        GTReportedEvents = [NSMutableSet set];
-        if (GTIsSafariMain()) {
-            GTRegisterSafariEventObservers();
-            GTPresentMessage(@"0.3.2 Safe Probe 已加载。\n\n请打开视频，先 1×，再切 2×。", 8);
-        } else if (GTIsBilibili()) {
-            GTPresentMessage(@"0.3.2 Safe Probe 已加载。\n\n已移除可能导致旧版 B站闪退的低层 AudioUnit/AudioQueue 探针。", 8);
-        }
+        GTShown = [NSMutableSet set];
+        NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
+        if (![bid isEqualToString:@"tv.danmaku.bilianime"]) return;
+
+        // Delay so bundled frameworks/classes have finished loading and UIKit is ready.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            GTInstallIJKHooks();
+        });
     }
 }

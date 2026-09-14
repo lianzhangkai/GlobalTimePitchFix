@@ -1,8 +1,6 @@
 {
     Filter = {
         Bundles = (
-            "com.apple.mobilesafari",
-            "com.apple.WebKit.WebContent",
             "tv.danmaku.bilianime"
         );
     };

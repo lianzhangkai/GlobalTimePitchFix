@@ -1,8 +1,8 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix Safe Audio Path Probe
-Version: 0.3.2
+Name: GlobalTimePitchFix Bili IJK Probe
+Version: 0.3.3
 Architecture: iphoneos-arm
-Description: Safe diagnostic probe for iPadOS 13.7 playback audio paths. No audio changes. Removes low-level real-time audio hooks that may crash older apps.
+Description: Bilibili-only safe IJK playback-rate path probe for iPadOS 13.7 Odyssey/libhooker.
 Maintainer: ChatGPT
 Author: ChatGPT
 Section: Tweaks
