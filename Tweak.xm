@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include "vendor/vlc_scaletempo/GTScaleTempo.h"
 
-// 0.7.2 architecture change:
+// 0.7.3 smooth-switch refinement on top of 0.7.2:
 // - The original ijk PCM callback is STILL called only from AudioQueue's callback thread.
 // - VLC-style scaletempo + S16<->float conversion run on a separate worker thread.
 // - Two SPSC rings decouple source PCM and processed PCM.
@@ -142,7 +142,8 @@ typedef struct GTPFContext {
     int frameBytes;
     int nominalCallbackFrames;
 
-    volatile float requestedSpeed;
+    volatile float requestedSpeed;   // UI/target speed
+    volatile float processingSpeed;  // speed currently used by worker/DSP
     volatile int stopped;
     volatile uint32_t epoch;
     volatile uint32_t workerEpoch;
@@ -172,6 +173,9 @@ typedef struct GTPFContext {
     int16_t lastOutput[2];
     int haveLastOutput;
     volatile int transitionPending;
+    volatile int enterBridgePending;
+    volatile int exitDrainPending;
+    volatile int exitDrainCallbacks;
     volatile uint64_t underrunFrames;
 } GTPFContext;
 
@@ -251,7 +255,7 @@ static void *GTPFWorkerMain(void *opaque) {
     uint32_t localEpoch = 0;
     while (!ctx->workerExit) {
         uint32_t e = __atomic_load_n(&ctx->epoch, __ATOMIC_ACQUIRE);
-        float speed = ctx->requestedSpeed;
+        float speed = ctx->processingSpeed;
         if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) speed = 1.0f;
 
         if (e != localEpoch) {
@@ -337,7 +341,9 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
         return;
     }
 
-    float speed = ctx->requestedSpeed;
+    float targetSpeed = ctx->requestedSpeed;
+    float speed = ctx->processingSpeed;
+    if (!isfinite(targetSpeed) || targetSpeed < 0.25f || targetSpeed > 6.0f) targetSpeed = 1.0f;
     if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) speed = 1.0f;
 
     if (ctx->frameBytes <= 0 || (len % ctx->frameBytes) != 0) {
@@ -358,9 +364,82 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
         ctx->transitionPending = 1;
     }
 
-    // Exact 1x bypass. The worker never calls originalCallback, so returning to 1x
-    // cannot race the source callback or leave DSP code in the hardware callback.
-    if (fabsf(speed - 1.0f) < 0.0001f || !ctx->workerStarted) {
+    // Entering DSP from exact 1x: do not force the very first hardware callback to
+    // wait for scaletempo's ~50 ms startup window. Play one normal 1x callback as a
+    // bridge, while prefetching FUTURE PCM for the worker. The speed change therefore
+    // starts one hardware buffer later, but without a silence/underrun notch.
+    if (ctx->enterBridgePending) {
+        if (__atomic_load_n(&ctx->workerEpoch, __ATOMIC_ACQUIRE) != e) {
+            // Worker has not reset yet. Keep playing clean 1x rather than blocking AQ.
+            ctx->originalCallback(ctx->originalUserdata, stream, len);
+            GTPFRememberTail(ctx, (int16_t *)stream, outputFrames);
+            return;
+        }
+
+        // This bridge PCM is played directly and is intentionally NOT fed into DSP,
+        // so the processed stream begins exactly after it (no duplicated audio).
+        ctx->originalCallback(ctx->originalUserdata, stream, len);
+        GTPFRememberTail(ctx, (int16_t *)stream, outputFrames);
+
+        if (GTPFEnsureCallbackScratch(ctx, outputFrames)) {
+            double lookAhead = (double)(ctx->sampleRate / 20 + outputFrames);
+            double desiredPulled = (double)speed * (double)outputFrames + lookAhead;
+            int pulls = 0;
+            const int maxPullsPerCallback = 16;
+            while (ctx->sourcePulledFrames + 0.5 < desiredPulled && pulls < maxPullsPerCallback) {
+                if (GTRingFree(&ctx->sourceRing) < outputFrames) break;
+                ctx->originalCallback(ctx->originalUserdata, (GTUint8 *)ctx->callbackScratch, len);
+                int written = GTRingWrite(&ctx->sourceRing, ctx->callbackScratch, outputFrames);
+                if (written != outputFrames) break;
+                ctx->sourcePulledFrames += (double)outputFrames;
+                pulls++;
+            }
+        }
+        ctx->transitionPending = 1; // crossfade first processed buffer from direct tail
+        __atomic_store_n(&ctx->enterBridgePending, 0, __ATOMIC_RELEASE);
+        return;
+    }
+
+    // Returning to 1x: the decoder is intentionally ahead by the DSP look-ahead.
+    // Dropping rings immediately makes a small timeline jump. Drain a few already-
+    // prefetched processed buffers WITHOUT pulling more source, then hand off to the
+    // exact 1x callback. This trades an imperceptible rate-release delay for continuity.
+    if (ctx->exitDrainPending && fabsf(targetSpeed - 1.0f) < 0.0001f && fabsf(speed - 1.0f) >= 0.0001f) {
+        int waitSpins = 0;
+        while (GTRingAvailable(&ctx->outputRing) < outputFrames && waitSpins++ < 40) usleep(100); // <=4 ms
+
+        int16_t *dst = (int16_t *)stream;
+        int got = GTRingRead(&ctx->outputRing, dst, outputFrames);
+        if (got < outputFrames) {
+            GTPFFillMissingSmooth(ctx, dst, got, outputFrames);
+        }
+        GTPFRememberTail(ctx, dst, outputFrames);
+
+        // Account for source-time represented by this final processed callback.
+        ctx->sourceDemandFrames += (double)speed * (double)got;
+        ctx->exitDrainCallbacks++;
+        double aheadSource = ctx->sourcePulledFrames - ctx->sourceDemandFrames;
+        if (aheadSource < 0.0) aheadSource = 0.0;
+
+        // Usually 1 callback is enough at 2x/3x; allow up to 3 to absorb larger
+        // callback sizes / look-ahead. If worker runs dry, hand off immediately.
+        BOOL canDrainMore = (got == outputFrames) &&
+                            (ctx->exitDrainCallbacks < 3) &&
+                            (aheadSource > (double)speed * (double)outputFrames * 0.20) &&
+                            (GTRingAvailable(&ctx->outputRing) > 0 || GTRingAvailable(&ctx->sourceRing) > 0);
+        if (canDrainMore) return;
+
+        ctx->processingSpeed = 1.0f;
+        ctx->exitDrainPending = 0;
+        ctx->exitDrainCallbacks = 0;
+        ctx->transitionPending = 1;
+        __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
+        return;
+    }
+
+    // Exact 1x bypass. The worker never calls originalCallback, so once the drain
+    // bridge completes, normal 1x is again bit-for-bit the original PCM path.
+    if ((fabsf(targetSpeed - 1.0f) < 0.0001f && fabsf(speed - 1.0f) < 0.0001f) || !ctx->workerStarted) {
         ctx->originalCallback(ctx->originalUserdata, stream, len);
         int16_t *dst = (int16_t *)stream;
         GTPFApplyTransitionFade(ctx, dst, outputFrames);
@@ -373,8 +452,8 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
         return;
     }
 
-    // Wait briefly for the worker to acknowledge a rate-path reset. During normal
-    // steady state this loop is skipped completely.
+    // Wait briefly for worker reset during non-1x operation. Entry from 1x normally
+    // avoids this path because enterBridgePending gives the worker a whole buffer.
     int ackSpins = 0;
     while (__atomic_load_n(&ctx->workerEpoch, __ATOMIC_ACQUIRE) != e && ackSpins++ < 20) usleep(100);
     if (__atomic_load_n(&ctx->workerEpoch, __ATOMIC_ACQUIRE) != e) {
@@ -448,6 +527,7 @@ static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec)
     if (ctx->nominalCallbackFrames > 16384) ctx->nominalCallbackFrames = 16384;
 
     ctx->requestedSpeed = 1.0f;
+    ctx->processingSpeed = 1.0f;
     ctx->epoch = 1;
     ctx->workerEpoch = 0;
     ctx->audioEpochSeen = 0;
@@ -513,28 +593,59 @@ static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
 
     float sane = rate;
     if (!isfinite(sane) || sane < 0.25f || sane > 6.0f) sane = 1.0f;
-    float old = ctx->requestedSpeed;
-    BOOL changed = fabsf(old - sane) > 0.0001f;
-    BOOL oldOne = fabsf(old - 1.0f) < 0.0001f;
+    float oldTarget = ctx->requestedSpeed;
+    float active = ctx->processingSpeed;
+    BOOL changed = fabsf(oldTarget - sane) > 0.0001f;
+    BOOL activeOne = fabsf(active - 1.0f) < 0.0001f;
     BOOL newOne = fabsf(sane - 1.0f) < 0.0001f;
+
     ctx->requestedSpeed = sane;
-    if (changed) {
-        ctx->transitionPending = 1;
-        // Reset rings/DSP only when crossing the exact-1x bypass boundary.
-        // Non-1x -> non-1x changes retain the audio history and only update speed.
-        if (oldOne != newOne) __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
+    if (changed) ctx->transitionPending = 1;
+
+    if (!newOne) {
+        if (activeOne) {
+            // 1x -> DSP: reset/arm DSP, but let the audio callback play one clean
+            // bridge buffer while the worker is primed with future PCM.
+            ctx->processingSpeed = sane;
+            ctx->exitDrainPending = 0;
+            ctx->exitDrainCallbacks = 0;
+            ctx->enterBridgePending = 1;
+            __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
+        } else {
+            // DSP -> DSP (2x <-> 3x etc.): keep history/rings; just retune speed.
+            ctx->processingSpeed = sane;
+            ctx->exitDrainPending = 0;
+            ctx->exitDrainCallbacks = 0;
+            ctx->enterBridgePending = 0;
+        }
+    } else {
+        if (!activeOne) {
+            // DSP -> 1x: do not reset yet. First drain the prefetched processed
+            // tail so the direct callback resumes much closer to the same timeline.
+            ctx->enterBridgePending = 0;
+            ctx->exitDrainPending = 1;
+            ctx->exitDrainCallbacks = 0;
+        } else {
+            ctx->enterBridgePending = 0;
+            ctx->exitDrainPending = 0;
+            ctx->exitDrainCallbacks = 0;
+        }
     }
 
+    // Hardware AudioQueue remains at 1x whenever our worker exists.
     if (orig_setPlaybackRate) {
         if (ctx->workerStarted) orig_setPlaybackRate(self, _cmd, 1.0f);
         else orig_setPlaybackRate(self, _cmd, sane);
     }
 }
-
 static void hook_flush(id self, SEL _cmd) {
     GTPFContext *ctx = GTPFGetContext(self);
     if (ctx) {
         ctx->transitionPending = 1;
+        ctx->enterBridgePending = 0;
+        ctx->exitDrainPending = 0;
+        ctx->exitDrainCallbacks = 0;
+        ctx->processingSpeed = ctx->requestedSpeed;
         __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
     }
     if (orig_flush) orig_flush(self, _cmd);
