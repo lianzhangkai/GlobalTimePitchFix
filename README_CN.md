@@ -1,95 +1,51 @@
-# GlobalTimePitchFix 0.7.1 — Bili VLC ScaleTempo Prototype
+# GlobalTimePitchFix 0.7.2 — VLC ScaleTempo Worker DSP
 
-目标：验证 APlayer / MobileVLCKit 路线里最可疑的 VLC `scaletempo` 算法，是否能让旧版 Bilibili 在 iPadOS 13.7 上的 2× / 3× 人声音质接近 APlayer。
+这是针对 0.7.0/0.7.1 在 0.5x / 2x / 3x 持续爆音、回到 1x 后仍噼啪的架构修正版。
 
-## 为什么换路线
+## 这版和 0.7.1 最大的区别
 
-已经实测：
+0.7.1 把 VLC-style `scaletempo` 的相关性搜索直接放在 AudioQueue 实时 callback 内执行。即使算法本身离线输出正常，只要 callback 偶发超时，就可能造成 AudioQueue underrun，表现为连续爆音/噼啪，而且队列一旦被打乱，回 1x 也可能继续异常。
 
-- Apple AudioQueue Spectral / TimeDomain：不够好
-- Sonic：同步和稳定性正常，但音质仍差
-- SoundTouch 0.6.2：比原版好一些，但仍明显不如 Android / APlayer
-- APlayer：Codec 1 / 2 的真正 3×（60 秒视频约 20 秒播完）音质仍很好；Codec 3 被限制到约 2×
-- APlayer 包含 MobileVLCKit/VLC 3.0.18，二进制内存在完整 `scaletempo` 模块
+0.7.2 改为：
 
-所以 0.7.1 不再使用 SoundTouch，改为 standalone VLC-style scaletempo。
+```
+AudioQueue callback
+  ├─ 仍然在原线程调用 ijk 原始 PCM callback（保持原有线程语义）
+  ├─ 把源 S16 PCM 写入 source ring
+  └─ 只从 output ring 取已经处理好的 S16 PCM
 
-## 0.7.1 音频路径
+worker thread
+  ├─ source ring -> Float32
+  ├─ VLC-style scaletempo
+  ├─ Float32 -> S16
+  └─ 写入 output ring
+```
 
-### 1×
+因此最耗时的 stride / overlap / correlation search 不再阻塞 AudioQueue callback。
 
-原始 Bilibili PCM -> 直接输出
+## 参数
 
-不经过 float 转换、不经过 scaletempo。
+仍然保持 VLC 3.0.x 默认 scaletempo 参数：
 
-### 1.5× / 2× / 3×
+- stride: 30 ms
+- overlap: 20%
+- search: 14 ms
 
-Bilibili IJK S16 PCM
--> Float32
--> VLC-style scaletempo
--> S16
--> AudioQueue 固定 1×
+1x 仍然完全旁路 DSP。
 
-IJKFFMoviePlayerController 仍保留真实用户速度，因此视频/时钟仍按真实倍速工作。
+## 测试重点
 
-## Scaletempo 参数
+安装后 Respring，分别测试：
 
-直接先测试 VLC 3.0.x 默认值，不做主观调参：
+- 1x -> 0.5x，保持 20 秒 -> 1x
+- 1x -> 2x，保持 20 秒 -> 1x
+- 1x -> 3x，保持 20 秒 -> 1x
 
-- stride = 30 ms
-- overlap = 20%
-- search = 14 ms
+请优先判断：
 
-算法会用加权互相关寻找最合适的 overlap 拼接位置。
+1. 持续噼啪/爆音是否消失；
+2. 回到 1x 后是否立即恢复干净；
+3. 是否出现短暂静音、明显跳音或 A/V 不同步；
+4. 在声音干净的前提下，再比较 2x/3x 音质和 APlayer。
 
-## 编译
-
-把整个目录上传/覆盖到 GitHub 仓库根目录，然后运行 `.github/workflows/build.yml`。
-
-这版不需要再下载 Sonic 或 SoundTouch，scaletempo 适配源码已经包含在 `vendor/vlc_scaletempo/`。
-
-成功后应该得到：
-
-`com.chatgpt.globaltimepitchfix_0.7.1_iphoneos-arm.deb`
-
-## 安装前
-
-0.7.1 包 ID 仍为：
-
-`com.chatgpt.globaltimepitchfix`
-
-因此会覆盖 0.6.2。
-
-## 测试顺序
-
-建议同一个清晰人声视频：
-
-1. 1× 20 秒：必须完全正常
-2. 2× 20 秒：和 0.6.2、Android、APlayer 对比
-3. 长按 3× 15 秒：重点听金属感、水下感、颤抖、拖影
-4. 松手回 1×：检查恢复速度、爆音、断音、同步
-5. 拖动进度条后再测 2× / 3×
-
-请记录四项：音质、断音、音画同步、3×松手回1×表现。
-
-## 已知原型限制
-
-- `stop` 时暂不释放 context，避免 AudioQueue callback 生命周期竞态；退出 Bilibili 后系统会回收。
-- 速度切换时会重建 scaletempo 状态，可能有很短的瞬态。
-- 当前只处理 ijkplayer 常见的 S16 mono/stereo PCM。
-- 回调内部仍可能因首次扩容发生 malloc/realloc；验证音质路线后再做实时线程优化。
-- 这是根据 VLC 3.0.x scaletempo 算法做的 standalone 适配，并非直接把 APlayer 私有二进制代码复制出来。
-
-
-## 0.7.1 变更
-
-针对 0.7.0 在 0.5x/2x/3x 切换时以及回到 1x 时出现的爆音：
-
-- GTScaleTempo 在音频控制器初始化时预创建，避免在 realtime AudioQueue callback 中 new/delete。
-- 常用 PCM scratch buffer 预分配，减少切速瞬间 malloc/realloc。
-- 1x <-> 非 1x 切换时加入约 5ms 波形过渡，避免硬跳变 click/pop。
-- 2x <-> 3x 之类的非 1x 切换不再清空 DSP 历史，只实时修改 speed。
-- 若发生短暂输出不足，不再从有效 PCM 突然硬切到全 0，而是快速衰减并在下一 callback 做恢复过渡。
-- max input-pull guard 从 24 提高到 64。
-
-这一版只针对爆音/切换稳定性，不宣称已经解决与 APlayer 的音质差距。
+0.7.2 仍是实验版。若出现持续爆音，请退出 Bilibili 并回退 0.6.2。

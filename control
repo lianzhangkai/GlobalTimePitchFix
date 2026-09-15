@@ -1,8 +1,8 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix - Bili VLC ScaleTempo Prototype
-Version: 0.7.1
+Name: GlobalTimePitchFix - Bili VLC ScaleTempo Worker DSP
+Version: 0.7.2
 Architecture: iphoneos-arm
-Description: Experimental Bilibili iOS 13 playback-speed audio using a standalone adaptation of VLC 3.0.x scaletempo (30ms stride, 20% overlap, 14ms search). 1x is exact PCM bypass; Apple AudioQueue rate DSP stays at 1x.
+Description: Experimental Bilibili iOS 13 playback-speed audio using VLC-style scaletempo on a worker thread. The ijk source callback remains on the AudioQueue thread; DSP is decoupled through SPSC PCM rings. 1x is exact PCM bypass.
 Maintainer: ChatGPT + user test build
 Author: ChatGPT + user test build
 Section: Tweaks
