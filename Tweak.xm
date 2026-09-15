@@ -39,7 +39,10 @@ typedef struct GTPFContext {
     volatile float requestedSpeed;
     volatile int resetRequested;
     volatile int stopped;
+    volatile int transitionPending;
     GTScaleTempo *scaleTempo;
+    int16_t lastOutput[2];
+    int haveLastOutput;
     int16_t *inputS16;
     float *inputF32;
     float *outputF32;
@@ -75,21 +78,53 @@ static BOOL GTPFEnsureCapacity(GTPFContext *ctx, int frames) {
 }
 
 static BOOL GTPFResetScaleTempo(GTPFContext *ctx, float speed) {
-    if (!ctx) return NO;
-    if (ctx->scaleTempo) {
-        delete ctx->scaleTempo;
-        ctx->scaleTempo = NULL;
-    }
-
-    GTScaleTempo *st = new (std::nothrow) GTScaleTempo(ctx->sampleRate, ctx->channels);
-    if (!st || !st->valid()) {
-        delete st;
-        return NO;
-    }
-    st->setSpeed(speed);
-    ctx->scaleTempo = st;
+    if (!ctx || !ctx->scaleTempo || !ctx->scaleTempo->valid()) return NO;
+    // 0.7.1: never allocate/free the DSP from the realtime AudioQueue callback.
+    // Reset only its buffered state; the object itself is pre-created at controller init.
+    ctx->scaleTempo->reset();
+    ctx->scaleTempo->setSpeed(speed);
     ctx->resetRequested = 0;
     return YES;
+}
+
+static void GTPFRememberTail(GTPFContext *ctx, const int16_t *samples, int frames) {
+    if (!ctx || !samples || frames <= 0) return;
+    const int base = (frames - 1) * ctx->channels;
+    for (int ch = 0; ch < ctx->channels && ch < 2; ++ch) ctx->lastOutput[ch] = samples[base + ch];
+    ctx->haveLastOutput = 1;
+}
+
+static void GTPFApplyTransitionFade(GTPFContext *ctx, int16_t *samples, int frames) {
+    if (!ctx || !samples || frames <= 0 || !ctx->transitionPending) return;
+    if (!ctx->haveLastOutput) {
+        ctx->transitionPending = 0;
+        return;
+    }
+
+    // Smooth the first ~5 ms after a rate-path switch.  A hard jump between the
+    // previous DSP/raw tail and the new buffer is exactly the kind of discontinuity
+    // that is heard as a sharp click/pop.
+    int fadeFrames = ctx->sampleRate / 200; // 5 ms
+    if (fadeFrames < 16) fadeFrames = 16;
+    if (fadeFrames > frames) fadeFrames = frames;
+    if (fadeFrames <= 1) {
+        ctx->transitionPending = 0;
+        return;
+    }
+
+    for (int f = 0; f < fadeFrames; ++f) {
+        float w = (float)f / (float)(fadeFrames - 1);
+        for (int ch = 0; ch < ctx->channels && ch < 2; ++ch) {
+            int idx = f * ctx->channels + ch;
+            float a = (float)ctx->lastOutput[ch];
+            float b = (float)samples[idx];
+            int v = (int)lrintf(a + (b - a) * w);
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            samples[idx] = (int16_t)v;
+        }
+    }
+    ctx->transitionPending = 0;
 }
 
 static inline int16_t GTPFFloatToS16(float x) {
@@ -111,10 +146,16 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
     float speed = ctx->requestedSpeed;
     if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) speed = 1.0f;
 
-    // Exact 1x bypass: no conversion, no DSP, original PCM goes straight to AudioQueue.
+    // Exact 1x bypass: no conversion, no DSP. 0.7.1 keeps a tiny transition
+    // crossfade so returning from a processed rate does not hard-step the waveform.
     if (fabsf(speed - 1.0f) < 0.0001f) {
         ctx->originalCallback(ctx->originalUserdata, stream, len);
-        ctx->resetRequested = 1;
+        int frames = (ctx->frameBytes > 0 && (len % ctx->frameBytes) == 0) ? (len / ctx->frameBytes) : 0;
+        if (frames > 0) {
+            int16_t *dst = (int16_t *)stream;
+            GTPFApplyTransitionFade(ctx, dst, frames);
+            GTPFRememberTail(ctx, dst, frames);
+        }
         return;
     }
 
@@ -142,7 +183,7 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
     // for one hardware AudioQueue callback. At 3x this normally consumes ~3x
     // source PCM while the hardware queue itself remains fixed at 1x.
     int loops = 0;
-    const int maxLoops = 24;
+    const int maxLoops = 64;
     while (ctx->scaleTempo->availableFrames() < outputFrames && loops < maxLoops) {
         ctx->originalCallback(ctx->originalUserdata, (GTUint8 *)ctx->inputS16, len);
         const int values = outputFrames * ctx->channels;
@@ -156,12 +197,25 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
     const int gotValues = got * ctx->channels;
     for (int i = 0; i < gotValues; ++i) dst[i] = GTPFFloatToS16(ctx->outputF32[i]);
 
-    // Startup or unexpected starvation: zero-fill only the missing tail.
+    // Startup or unexpected starvation. Avoid an abrupt signal->zero edge: taper the
+    // missing tail toward zero and request a short fade on the next callback.
     if (got < outputFrames) {
-        size_t offset = (size_t)got * (size_t)ctx->frameBytes;
-        size_t missing = (size_t)(outputFrames - got) * (size_t)ctx->frameBytes;
-        memset(stream + offset, 0, missing);
+        int16_t tail[2] = {0, 0};
+        if (got > 0) {
+            int base = (got - 1) * ctx->channels;
+            for (int ch = 0; ch < ctx->channels && ch < 2; ++ch) tail[ch] = dst[base + ch];
+        }
+        int missingFrames = outputFrames - got;
+        for (int f = 0; f < missingFrames; ++f) {
+            float k = 1.0f - ((float)(f + 1) / (float)missingFrames);
+            for (int ch = 0; ch < ctx->channels && ch < 2; ++ch)
+                dst[(got + f) * ctx->channels + ch] = (int16_t)lrintf((float)tail[ch] * k);
+        }
+        ctx->transitionPending = 1;
     }
+
+    GTPFApplyTransitionFade(ctx, dst, outputFrames);
+    GTPFRememberTail(ctx, dst, outputFrames);
 }
 
 typedef id (*InitAudioSpecIMP)(id, SEL, const GTSDL_AudioSpec *);
@@ -189,7 +243,29 @@ static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec)
     ctx->requestedSpeed = 1.0f;
     ctx->resetRequested = 1;
     ctx->stopped = 0;
-    ctx->scaleTempo = NULL;
+    ctx->transitionPending = 0;
+    ctx->scaleTempo = new (std::nothrow) GTScaleTempo(ctx->sampleRate, ctx->channels);
+    ctx->haveLastOutput = 0;
+    if (!ctx->scaleTempo || !ctx->scaleTempo->valid()) {
+        delete ctx->scaleTempo;
+        free(ctx);
+        return orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, spec) : nil;
+    }
+
+    // Preallocate normal callback scratch outside the realtime callback. This avoids
+    // malloc/realloc spikes at the instant the user changes playback speed.
+    int preFrames = spec->samples > 0 ? (int)spec->samples : 4096;
+    if (spec->size > 0 && ctx->frameBytes > 0) {
+        int bySize = (int)(spec->size / (GTUint32)ctx->frameBytes);
+        if (bySize > preFrames) preFrames = bySize;
+    }
+    if (preFrames < 4096) preFrames = 4096;
+    if (!GTPFEnsureCapacity(ctx, preFrames)) {
+        delete ctx->scaleTempo;
+        free(ctx->inputS16); free(ctx->inputF32); free(ctx->outputF32);
+        free(ctx);
+        return orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, spec) : nil;
+    }
 
     GTSDL_AudioSpec modified = *spec;
     modified.callback = GTPFPCMCallback;
@@ -197,6 +273,8 @@ static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec)
 
     id result = orig_initWithAudioSpec ? orig_initWithAudioSpec(self, _cmd, &modified) : nil;
     if (!result) {
+        delete ctx->scaleTempo;
+        free(ctx->inputS16); free(ctx->inputF32); free(ctx->outputF32);
         free(ctx);
         return nil;
     }
@@ -211,8 +289,15 @@ static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
         float sane = rate;
         if (!isfinite(sane) || sane < 0.25f || sane > 6.0f) sane = 1.0f;
         float old = ctx->requestedSpeed;
-        ctx->requestedSpeed = sane;
-        if (fabsf(old - sane) > 0.0001f) ctx->resetRequested = 1;
+        if (fabsf(old - sane) > 0.0001f) {
+            const BOOL oldOne = fabsf(old - 1.0f) < 0.0001f;
+            const BOOL newOne = fabsf(sane - 1.0f) < 0.0001f;
+            ctx->requestedSpeed = sane;
+            ctx->transitionPending = 1;
+            // Crossing the 1x bypass boundary invalidates buffered DSP audio. A
+            // non-1x -> non-1x change can safely keep VLC scaletempo's history.
+            if (oldOne != newOne) ctx->resetRequested = 1;
+        }
     }
 
     // Keep Apple's AudioQueue playback-rate DSP completely out of the path.
@@ -223,7 +308,7 @@ static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
 
 static void hook_flush(id self, SEL _cmd) {
     GTPFContext *ctx = GTPFGetContext(self);
-    if (ctx) ctx->resetRequested = 1;
+    if (ctx) { ctx->resetRequested = 1; ctx->transitionPending = 1; }
     if (orig_flush) orig_flush(self, _cmd);
 }
 

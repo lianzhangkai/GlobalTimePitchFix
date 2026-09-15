@@ -1,6 +1,6 @@
 Package: com.chatgpt.globaltimepitchfix
 Name: GlobalTimePitchFix - Bili VLC ScaleTempo Prototype
-Version: 0.7.0
+Version: 0.7.1
 Architecture: iphoneos-arm
 Description: Experimental Bilibili iOS 13 playback-speed audio using a standalone adaptation of VLC 3.0.x scaletempo (30ms stride, 20% overlap, 14ms search). 1x is exact PCM bypass; Apple AudioQueue rate DSP stays at 1x.
 Maintainer: ChatGPT + user test build

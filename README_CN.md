@@ -1,4 +1,4 @@
-# GlobalTimePitchFix 0.7.0 — Bili VLC ScaleTempo Prototype
+# GlobalTimePitchFix 0.7.1 — Bili VLC ScaleTempo Prototype
 
 目标：验证 APlayer / MobileVLCKit 路线里最可疑的 VLC `scaletempo` 算法，是否能让旧版 Bilibili 在 iPadOS 13.7 上的 2× / 3× 人声音质接近 APlayer。
 
@@ -12,9 +12,9 @@
 - APlayer：Codec 1 / 2 的真正 3×（60 秒视频约 20 秒播完）音质仍很好；Codec 3 被限制到约 2×
 - APlayer 包含 MobileVLCKit/VLC 3.0.18，二进制内存在完整 `scaletempo` 模块
 
-所以 0.7.0 不再使用 SoundTouch，改为 standalone VLC-style scaletempo。
+所以 0.7.1 不再使用 SoundTouch，改为 standalone VLC-style scaletempo。
 
-## 0.7.0 音频路径
+## 0.7.1 音频路径
 
 ### 1×
 
@@ -50,11 +50,11 @@ IJKFFMoviePlayerController 仍保留真实用户速度，因此视频/时钟仍�
 
 成功后应该得到：
 
-`com.chatgpt.globaltimepitchfix_0.7.0_iphoneos-arm.deb`
+`com.chatgpt.globaltimepitchfix_0.7.1_iphoneos-arm.deb`
 
 ## 安装前
 
-0.7.0 包 ID 仍为：
+0.7.1 包 ID 仍为：
 
 `com.chatgpt.globaltimepitchfix`
 
@@ -79,3 +79,17 @@ IJKFFMoviePlayerController 仍保留真实用户速度，因此视频/时钟仍�
 - 当前只处理 ijkplayer 常见的 S16 mono/stereo PCM。
 - 回调内部仍可能因首次扩容发生 malloc/realloc；验证音质路线后再做实时线程优化。
 - 这是根据 VLC 3.0.x scaletempo 算法做的 standalone 适配，并非直接把 APlayer 私有二进制代码复制出来。
+
+
+## 0.7.1 变更
+
+针对 0.7.0 在 0.5x/2x/3x 切换时以及回到 1x 时出现的爆音：
+
+- GTScaleTempo 在音频控制器初始化时预创建，避免在 realtime AudioQueue callback 中 new/delete。
+- 常用 PCM scratch buffer 预分配，减少切速瞬间 malloc/realloc。
+- 1x <-> 非 1x 切换时加入约 5ms 波形过渡，避免硬跳变 click/pop。
+- 2x <-> 3x 之类的非 1x 切换不再清空 DSP 历史，只实时修改 speed。
+- 若发生短暂输出不足，不再从有效 PCM 突然硬切到全 0，而是快速衰减并在下一 callback 做恢复过渡。
+- max input-pull guard 从 24 提高到 64。
+
+这一版只针对爆音/切换稳定性，不宣称已经解决与 APlayer 的音质差距。
