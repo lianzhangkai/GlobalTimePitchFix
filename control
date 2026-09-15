@@ -1,8 +1,8 @@
 Package: com.chatgpt.globaltimepitchfix
-Name: GlobalTimePitchFix - Bili VLC ScaleTempo Smooth Switch
-Version: 0.7.3
+Name: GlobalTimePitchFix - Bili VLC ScaleTempo Daily
+Version: 0.8.0
 Architecture: iphoneos-arm
-Description: Experimental Bilibili iOS 13 playback-speed audio using VLC-style scaletempo on a worker thread. The ijk source callback remains on the AudioQueue thread; DSP is decoupled through SPSC PCM rings; 0.7.3 adds bridge/drain transitions for smoother 1x <-> speed changes. 1x is exact PCM bypass.
+Description: Daily-use Bilibili iOS 13 playback-speed audio fix using VLC-style scaletempo on a worker thread. Keeps the proven 0.7.3 steady-state DSP, exact 1x PCM bypass and smooth bridge/drain transitions, with safer seek/flush recovery, rapid-tap cancellation and close/stop lifecycle handling.
 Maintainer: ChatGPT + user test build
 Author: ChatGPT + user test build
 Section: Tweaks

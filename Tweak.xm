@@ -11,11 +11,15 @@
 #include <unistd.h>
 #include "vendor/vlc_scaletempo/GTScaleTempo.h"
 
-// 0.7.3 smooth-switch refinement on top of 0.7.2:
-// - The original ijk PCM callback is STILL called only from AudioQueue's callback thread.
-// - VLC-style scaletempo + S16<->float conversion run on a separate worker thread.
-// - Two SPSC rings decouple source PCM and processed PCM.
-// This keeps the expensive correlation search out of the realtime AudioQueue callback.
+// 0.8.0 daily-use build on top of the proven 0.7.3 worker-DSP design:
+// - Keep VLC-style scaletempo parameters and steady-state 2x/3x path unchanged.
+// - Preserve exact 1x PCM bypass.
+// - Make rapid 1x <-> speed taps cancel cleanly before DSP has actually engaged.
+// - Re-prime through the same smooth entry bridge after seek/flush instead of asking
+//   an empty DSP pipeline to produce immediately.
+// - Hook close as well as stop so worker threads are always told to exit when a
+//   player instance is retired. Context memory remains conservatively retained until
+//   process exit to avoid AudioQueue callback use-after-free on old ijk builds.
 
 typedef uint8_t  GTUint8;
 typedef uint16_t GTUint16;
@@ -176,6 +180,9 @@ typedef struct GTPFContext {
     volatile int enterBridgePending;
     volatile int exitDrainPending;
     volatile int exitDrainCallbacks;
+    volatile int dspEngaged;          // at least one processed callback reached hardware
+    volatile int resetInProgress;     // seek/flush guard
+    volatile uint32_t consecutiveUnderrunCallbacks;
     volatile uint64_t underrunFrames;
 } GTPFContext;
 
@@ -184,6 +191,31 @@ static const void *kGTPFContextKey = &kGTPFContextKey;
 static GTPFContext *GTPFGetContext(id obj) {
     NSValue *value = objc_getAssociatedObject(obj, kGTPFContextKey);
     return value ? (GTPFContext *)[value pointerValue] : NULL;
+}
+
+static inline float GTPFSanitizeSpeed(float speed) {
+    if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) return 1.0f;
+    return speed;
+}
+
+static inline BOOL GTPFIsOne(float speed) {
+    return fabsf(speed - 1.0f) < 0.0001f;
+}
+
+static void GTPFResetTimelineState(GTPFContext *ctx, BOOL smoothReentry) {
+    if (!ctx) return;
+    float target = GTPFSanitizeSpeed(ctx->requestedSpeed);
+    ctx->processingSpeed = target;
+    ctx->sourceDemandFrames = 0.0;
+    ctx->sourcePulledFrames = 0.0;
+    ctx->audioEpochSeen = 0;
+    ctx->exitDrainPending = 0;
+    ctx->exitDrainCallbacks = 0;
+    ctx->dspEngaged = 0;
+    ctx->consecutiveUnderrunCallbacks = 0;
+    ctx->enterBridgePending = (smoothReentry && !GTPFIsOne(target)) ? 1 : 0;
+    ctx->transitionPending = 1;
+    __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
 }
 
 static inline int16_t GTPFFloatToS16(float x) {
@@ -255,8 +287,7 @@ static void *GTPFWorkerMain(void *opaque) {
     uint32_t localEpoch = 0;
     while (!ctx->workerExit) {
         uint32_t e = __atomic_load_n(&ctx->epoch, __ATOMIC_ACQUIRE);
-        float speed = ctx->processingSpeed;
-        if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) speed = 1.0f;
+        float speed = GTPFSanitizeSpeed(ctx->processingSpeed);
 
         if (e != localEpoch) {
             ctx->scaleTempo->reset();
@@ -341,10 +372,13 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
         return;
     }
 
-    float targetSpeed = ctx->requestedSpeed;
-    float speed = ctx->processingSpeed;
-    if (!isfinite(targetSpeed) || targetSpeed < 0.25f || targetSpeed > 6.0f) targetSpeed = 1.0f;
-    if (!isfinite(speed) || speed < 0.25f || speed > 6.0f) speed = 1.0f;
+    if (__atomic_load_n(&ctx->resetInProgress, __ATOMIC_ACQUIRE)) {
+        memset(stream, 0, (size_t)len);
+        return;
+    }
+
+    float targetSpeed = GTPFSanitizeSpeed(ctx->requestedSpeed);
+    float speed = GTPFSanitizeSpeed(ctx->processingSpeed);
 
     if (ctx->frameBytes <= 0 || (len % ctx->frameBytes) != 0) {
         ctx->originalCallback(ctx->originalUserdata, stream, len);
@@ -432,6 +466,7 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
         ctx->processingSpeed = 1.0f;
         ctx->exitDrainPending = 0;
         ctx->exitDrainCallbacks = 0;
+        ctx->dspEngaged = 0;
         ctx->transitionPending = 1;
         __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
         return;
@@ -491,7 +526,13 @@ static void GTPFPCMCallback(void *userdata, GTUint8 *stream, int len) {
 
     int16_t *dst = (int16_t *)stream;
     int got = GTRingRead(&ctx->outputRing, dst, outputFrames);
-    if (got < outputFrames) GTPFFillMissingSmooth(ctx, dst, got, outputFrames);
+    if (got < outputFrames) {
+        GTPFFillMissingSmooth(ctx, dst, got, outputFrames);
+        __atomic_add_fetch(&ctx->consecutiveUnderrunCallbacks, 1u, __ATOMIC_RELAXED);
+    } else {
+        __atomic_store_n(&ctx->consecutiveUnderrunCallbacks, 0u, __ATOMIC_RELAXED);
+    }
+    if (got > 0) __atomic_store_n(&ctx->dspEngaged, 1, __ATOMIC_RELEASE);
     GTPFApplyTransitionFade(ctx, dst, outputFrames);
     GTPFRememberTail(ctx, dst, outputFrames);
 }
@@ -504,6 +545,7 @@ static InitAudioSpecIMP orig_initWithAudioSpec = NULL;
 static RateSetterIMP orig_setPlaybackRate = NULL;
 static VoidMethodIMP orig_flush = NULL;
 static VoidMethodIMP orig_stop = NULL;
+static VoidMethodIMP orig_close = NULL;
 
 static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec) {
     if (!spec || !spec->callback || spec->freq <= 0 || spec->channels < 1 || spec->channels > 2 || spec->format != GT_AUDIO_S16SYS) {
@@ -532,6 +574,9 @@ static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec)
     ctx->workerEpoch = 0;
     ctx->audioEpochSeen = 0;
     ctx->transitionPending = 0;
+    ctx->dspEngaged = 0;
+    ctx->resetInProgress = 0;
+    ctx->consecutiveUnderrunCallbacks = 0;
 
     ctx->scaleTempo = new (std::nothrow) GTScaleTempo(ctx->sampleRate, ctx->channels);
     if (!ctx->scaleTempo || !ctx->scaleTempo->valid()) {
@@ -586,33 +631,33 @@ static id hook_initWithAudioSpec(id self, SEL _cmd, const GTSDL_AudioSpec *spec)
 
 static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
     GTPFContext *ctx = GTPFGetContext(self);
-    if (!ctx) {
+    if (!ctx || ctx->stopped) {
         if (orig_setPlaybackRate) orig_setPlaybackRate(self, _cmd, rate);
         return;
     }
 
-    float sane = rate;
-    if (!isfinite(sane) || sane < 0.25f || sane > 6.0f) sane = 1.0f;
-    float oldTarget = ctx->requestedSpeed;
-    float active = ctx->processingSpeed;
+    float sane = GTPFSanitizeSpeed(rate);
+    float oldTarget = GTPFSanitizeSpeed(ctx->requestedSpeed);
+    float active = GTPFSanitizeSpeed(ctx->processingSpeed);
     BOOL changed = fabsf(oldTarget - sane) > 0.0001f;
-    BOOL activeOne = fabsf(active - 1.0f) < 0.0001f;
-    BOOL newOne = fabsf(sane - 1.0f) < 0.0001f;
+    BOOL activeOne = GTPFIsOne(active);
+    BOOL newOne = GTPFIsOne(sane);
 
     ctx->requestedSpeed = sane;
     if (changed) ctx->transitionPending = 1;
 
     if (!newOne) {
         if (activeOne) {
-            // 1x -> DSP: reset/arm DSP, but let the audio callback play one clean
-            // bridge buffer while the worker is primed with future PCM.
+            // 1x -> DSP: arm/reset the worker, but let one exact-1x bridge callback
+            // play while future PCM is prefetched. This is the proven 0.7.3 path.
             ctx->processingSpeed = sane;
             ctx->exitDrainPending = 0;
             ctx->exitDrainCallbacks = 0;
+            ctx->dspEngaged = 0;
             ctx->enterBridgePending = 1;
             __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
         } else {
-            // DSP -> DSP (2x <-> 3x etc.): keep history/rings; just retune speed.
+            // DSP -> DSP (2x <-> 3x): preserve scaletempo history and rings.
             ctx->processingSpeed = sane;
             ctx->exitDrainPending = 0;
             ctx->exitDrainCallbacks = 0;
@@ -620,19 +665,34 @@ static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
         }
     } else {
         if (!activeOne) {
-            // DSP -> 1x: do not reset yet. First drain the prefetched processed
-            // tail so the direct callback resumes much closer to the same timeline.
-            ctx->enterBridgePending = 0;
-            ctx->exitDrainPending = 1;
-            ctx->exitDrainCallbacks = 0;
+            // Very short press/tap: if the DSP has not actually reached hardware yet,
+            // cancel the pending entry instead of draining audio the listener never heard.
+            // This removes a common "tap 3x then release immediately" hiccup.
+            BOOL engaged = __atomic_load_n(&ctx->dspEngaged, __ATOMIC_ACQUIRE) != 0;
+            if (ctx->enterBridgePending || !engaged) {
+                ctx->processingSpeed = 1.0f;
+                ctx->enterBridgePending = 0;
+                ctx->exitDrainPending = 0;
+                ctx->exitDrainCallbacks = 0;
+                ctx->dspEngaged = 0;
+                ctx->sourceDemandFrames = 0.0;
+                ctx->sourcePulledFrames = 0.0;
+                __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
+            } else {
+                // Normal DSP -> 1x: drain a small prefetched tail before exact bypass.
+                ctx->enterBridgePending = 0;
+                ctx->exitDrainPending = 1;
+                ctx->exitDrainCallbacks = 0;
+            }
         } else {
             ctx->enterBridgePending = 0;
             ctx->exitDrainPending = 0;
             ctx->exitDrainCallbacks = 0;
+            ctx->dspEngaged = 0;
         }
     }
 
-    // Hardware AudioQueue remains at 1x whenever our worker exists.
+    // Hardware AudioQueue remains at 1x while our worker is active.
     if (orig_setPlaybackRate) {
         if (ctx->workerStarted) orig_setPlaybackRate(self, _cmd, 1.0f);
         else orig_setPlaybackRate(self, _cmd, sane);
@@ -640,26 +700,43 @@ static void hook_setPlaybackRate(id self, SEL _cmd, float rate) {
 }
 static void hook_flush(id self, SEL _cmd) {
     GTPFContext *ctx = GTPFGetContext(self);
-    if (ctx) {
-        ctx->transitionPending = 1;
-        ctx->enterBridgePending = 0;
-        ctx->exitDrainPending = 0;
-        ctx->exitDrainCallbacks = 0;
-        ctx->processingSpeed = ctx->requestedSpeed;
-        __atomic_add_fetch(&ctx->epoch, 1u, __ATOMIC_ACQ_REL);
-    }
+    if (ctx) __atomic_store_n(&ctx->resetInProgress, 1, __ATOMIC_RELEASE);
+
+    // Let ijk flush its own AudioQueue/decoder-facing state first. During this very
+    // short window our callback returns silence instead of touching stale rings.
     if (orig_flush) orig_flush(self, _cmd);
+
+    if (ctx && !ctx->stopped) {
+        // A seek/flush is a real timeline discontinuity: throw away old prefetched
+        // PCM and, if the requested rate is still 2x/3x, re-enter through the same
+        // smooth bridge used by a normal 1x -> speed transition.
+        GTPFResetTimelineState(ctx, YES);
+        __atomic_store_n(&ctx->resetInProgress, 0, __ATOMIC_RELEASE);
+    } else if (ctx) {
+        __atomic_store_n(&ctx->resetInProgress, 0, __ATOMIC_RELEASE);
+    }
+}
+
+static void GTPFMarkStopped(GTPFContext *ctx) {
+    if (!ctx) return;
+    ctx->enterBridgePending = 0;
+    ctx->exitDrainPending = 0;
+    ctx->exitDrainCallbacks = 0;
+    ctx->dspEngaged = 0;
+    ctx->stopped = 1;
+    ctx->workerExit = 1;
 }
 
 static void hook_stop(id self, SEL _cmd) {
     GTPFContext *ctx = GTPFGetContext(self);
-    if (ctx) {
-        // Same conservative lifecycle policy as the earlier stable prototypes:
-        // do not free context memory while AudioQueue callbacks may be unwinding.
-        ctx->stopped = 1;
-        ctx->workerExit = 1;
-    }
+    GTPFMarkStopped(ctx);
     if (orig_stop) orig_stop(self, _cmd);
+}
+
+static void hook_close(id self, SEL _cmd) {
+    GTPFContext *ctx = GTPFGetContext(self);
+    GTPFMarkStopped(ctx);
+    if (orig_close) orig_close(self, _cmd);
 }
 
 static BOOL GTHookMethod(Class cls, SEL sel, IMP replacement, IMP *originalOut) {
@@ -675,6 +752,7 @@ static void GTPFInstall(void) {
     GTHookMethod(cls, @selector(setPlaybackRate:), (IMP)hook_setPlaybackRate, (IMP *)&orig_setPlaybackRate);
     GTHookMethod(cls, @selector(flush), (IMP)hook_flush, (IMP *)&orig_flush);
     GTHookMethod(cls, @selector(stop), (IMP)hook_stop, (IMP *)&orig_stop);
+    GTHookMethod(cls, @selector(close), (IMP)hook_close, (IMP *)&orig_close);
 }
 
 %ctor {
